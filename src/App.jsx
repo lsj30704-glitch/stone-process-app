@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BUILDINGS_EXTERNAL, BUILDINGS_INTERNAL, SEED_LOGS_EXTERNAL, SEED_LOGS_INTERNAL,
-  DONG_LIST, DONG_LIST_INTERNAL, DISASTER_OPTIONS, REASON_CODES, THRESHOLDS,
+  DISASTER_OPTIONS, REASON_CODES, THRESHOLDS,
 } from "./data";
 import {
   calcRowExternal, calcRowInternal, calcExternalDashboard, calcInternalDashboard,
@@ -14,11 +14,14 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function emptyExternalForm() {
-  return { date: today(), dong: DONG_LIST[0], masonry: "", caulking: "", truss: "", scaffold: "", actual: "", disaster: "N (정상)", reason: "", note: "", memo: "" };
+// 내부(세대) 동 목록에는 기준정보(엑셀)에 세대수가 없는 특수 구역도 선택할 수 있게 항상 추가해줌
+const EXTRA_INTERNAL_DONG = "게스트하우스";
+
+function emptyExternalForm(dongList) {
+  return { date: today(), dong: dongList?.[0] || "", masonry: "", caulking: "", truss: "", scaffold: "", actual: "", disaster: "N (정상)", reason: "", note: "", memo: "" };
 }
-function emptyInternalForm() {
-  return { date: today(), dong: DONG_LIST_INTERNAL[0], masonry: "", caulking: "", truss: "", actual: "", disaster: "N (정상)", reason: "", note: "", memo: "" };
+function emptyInternalForm(dongList) {
+  return { date: today(), dong: dongList?.[0] || "", masonry: "", caulking: "", truss: "", actual: "", disaster: "N (정상)", reason: "", note: "", memo: "" };
 }
 
 export default function App() {
@@ -34,9 +37,14 @@ export default function App() {
   const [pendingInternal, setPendingInternal] = useState(() => Storage.get(Storage.KEYS.pendingInternal, []));
   const [checklist, setChecklist] = useState(() => Storage.get(Storage.KEYS.checklist, {}));
 
-  const [formExternal, setFormExternal] = useState(emptyExternalForm);
-  const [formInternal, setFormInternal] = useState(emptyInternalForm);
-  const [recoveryDong, setRecoveryDong] = useState(DONG_LIST[0]);
+  // 동 목록은 고정 상수가 아니라 기준정보(엑셀 ①기준정보, 동기화로 갱신됨)에서 파생.
+  // 현장이 바뀌어 엑셀의 기준정보(동 목록/계획수량 등)가 바뀌면 동기화 시 여기도 자동으로 갱신됨.
+  const dongListExternal = useMemo(() => buildingsExternal.map((b) => b.dong), [buildingsExternal]);
+  const dongListInternal = useMemo(() => [...buildingsInternal.map((b) => b.dong), EXTRA_INTERNAL_DONG], [buildingsInternal]);
+
+  const [formExternal, setFormExternal] = useState(() => emptyExternalForm(dongListExternal));
+  const [formInternal, setFormInternal] = useState(() => emptyInternalForm(dongListInternal));
+  const [recoveryDong, setRecoveryDong] = useState(() => dongListExternal[0] || "");
 
   const [account, setAccount] = useState(null);
   const [sync, setSync] = useState({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.KEYS.fileMeta, {})?.lastSyncedAt || null });
@@ -50,6 +58,22 @@ export default function App() {
   useEffect(() => { Storage.set(Storage.KEYS.pendingExternal, pendingExternal); }, [pendingExternal]);
   useEffect(() => { Storage.set(Storage.KEYS.pendingInternal, pendingInternal); }, [pendingInternal]);
   useEffect(() => { Storage.set(Storage.KEYS.checklist, checklist); }, [checklist]);
+
+  // 기준정보 동기화로 동 목록이 바뀌어 현재 선택값이 더 이상 유효하지 않으면 새 목록의 첫 항목으로 보정
+  useEffect(() => {
+    if (dongListExternal.length && !dongListExternal.includes(formExternal.dong)) {
+      setFormExternal((f) => ({ ...f, dong: dongListExternal[0] }));
+    }
+    if (dongListExternal.length && !dongListExternal.includes(recoveryDong)) {
+      setRecoveryDong(dongListExternal[0]);
+    }
+  }, [dongListExternal]);
+
+  useEffect(() => {
+    if (dongListInternal.length && !dongListInternal.includes(formInternal.dong)) {
+      setFormInternal((f) => ({ ...f, dong: dongListInternal[0] }));
+    }
+  }, [dongListInternal]);
 
   useEffect(() => {
     if (!Graph.isConfigured()) return;
@@ -108,7 +132,7 @@ export default function App() {
       setLogsExternal(mergedExternal);
       setLogsInternal(mergedInternal);
       if (result.buildings.external.length) setBuildingsExternal(result.buildings.external);
-      if (result.buildings.internal.length) setBuildingsInternal((prev) => result.buildings.internal.map((b, i) => ({ ...b, ...prev[i], ...b })));
+      if (result.buildings.internal.length) setBuildingsInternal(result.buildings.internal);
       setPendingExternal([]);
       setPendingInternal([]);
 
@@ -139,7 +163,7 @@ export default function App() {
     };
     setLogsExternal((prev) => [...prev, calcRowExternal(entry, buildingsExternal)]);
     setPendingExternal((prev) => [...prev, entry]);
-    setFormExternal(emptyExternalForm());
+    setFormExternal(emptyExternalForm(dongListExternal));
     if (account) setTimeout(runSync, 50);
   }
 
@@ -160,7 +184,7 @@ export default function App() {
     };
     setLogsInternal((prev) => [...prev, calcRowInternal(entry)]);
     setPendingInternal((prev) => [...prev, entry]);
-    setFormInternal(emptyInternalForm());
+    setFormInternal(emptyInternalForm(dongListInternal));
     if (account) setTimeout(runSync, 50);
   }
 
@@ -191,6 +215,7 @@ export default function App() {
             formInternal={formInternal} setFormInternal={setFormInternal}
             saveExternal={saveExternal} saveInternal={saveInternal}
             logsExternal={logsExternal} logsInternal={logsInternal}
+            dongListExternal={dongListExternal} dongListInternal={dongListInternal}
           />
         )}
         {tab === "dash" && (
@@ -199,7 +224,7 @@ export default function App() {
         {tab === "recovery" && (
           <RecoveryTab
             recoveryDong={recoveryDong} setRecoveryDong={setRecoveryDong} recovery={recovery}
-            checklist={checklist} toggleCheck={toggleCheck}
+            checklist={checklist} toggleCheck={toggleCheck} dongListExternal={dongListExternal}
           />
         )}
         {tab === "base" && (
@@ -243,7 +268,7 @@ function Field({ label, children }) {
   );
 }
 
-function InputTab({ mode, setMode, formExternal, setFormExternal, formInternal, setFormInternal, saveExternal, saveInternal, logsExternal, logsInternal }) {
+function InputTab({ mode, setMode, formExternal, setFormExternal, formInternal, setFormInternal, saveExternal, saveInternal, logsExternal, logsInternal, dongListExternal, dongListInternal }) {
   return (
     <div>
       <div className="toggle2">
@@ -259,7 +284,7 @@ function InputTab({ mode, setMode, formExternal, setFormExternal, formInternal, 
           </Field>
           <Field label="해당 동(구역)">
             <select value={formExternal.dong} onChange={(e) => setFormExternal({ ...formExternal, dong: e.target.value })}>
-              {DONG_LIST.map((d) => <option key={d} value={d}>{d}</option>)}
+              {dongListExternal.map((d) => <option key={d} value={d}>{d}</option>)}
             </select>
           </Field>
           <div className="row">
@@ -302,7 +327,7 @@ function InputTab({ mode, setMode, formExternal, setFormExternal, formInternal, 
           </Field>
           <Field label="해당 동(구역)">
             <select value={formInternal.dong} onChange={(e) => setFormInternal({ ...formInternal, dong: e.target.value })}>
-              {DONG_LIST_INTERNAL.map((d) => <option key={d} value={d}>{d}</option>)}
+              {dongListInternal.map((d) => <option key={d} value={d}>{d}</option>)}
             </select>
           </Field>
           <div className="row">
@@ -432,14 +457,14 @@ function DashTab({ mode, setMode, dashExternal, dashInternal }) {
   );
 }
 
-function RecoveryTab({ recoveryDong, setRecoveryDong, recovery, checklist, toggleCheck }) {
+function RecoveryTab({ recoveryDong, setRecoveryDong, recovery, checklist, toggleCheck, dongListExternal }) {
   return (
     <div>
       <div className="card">
         <h2>만회계획 자동 산출</h2>
         <Field label="대상 동 선택">
           <select value={recoveryDong} onChange={(e) => setRecoveryDong(e.target.value)}>
-            {DONG_LIST.map((d) => <option key={d} value={d}>{d}</option>)}
+            {dongListExternal.map((d) => <option key={d} value={d}>{d}</option>)}
           </select>
         </Field>
         {recovery && (
