@@ -29,13 +29,22 @@ export default function App() {
   const [inputMode, setInputMode] = useState("external");
   const [dashMode, setDashMode] = useState("external");
 
-  const [buildingsExternal, setBuildingsExternal] = useState(() => Storage.get(Storage.KEYS.buildingsExternal, BUILDINGS_EXTERNAL));
-  const [buildingsInternal, setBuildingsInternal] = useState(() => Storage.get(Storage.KEYS.buildingsInternal, BUILDINGS_INTERNAL));
-  const [logsExternal, setLogsExternal] = useState(() => Storage.get(Storage.KEYS.logsExternal, SEED_LOGS_EXTERNAL));
-  const [logsInternal, setLogsInternal] = useState(() => Storage.get(Storage.KEYS.logsInternal, SEED_LOGS_INTERNAL));
-  const [pendingExternal, setPendingExternal] = useState(() => Storage.get(Storage.KEYS.pendingExternal, []));
-  const [pendingInternal, setPendingInternal] = useState(() => Storage.get(Storage.KEYS.pendingInternal, []));
-  const [checklist, setChecklist] = useState(() => Storage.get(Storage.KEYS.checklist, {}));
+  // 현장(site)이 여러 개일 수 있음 — 각 현장은 자기만의 OneDrive 파일(경로)과 데이터를 가짐
+  const [sites, setSites] = useState(() => Storage.getSites());
+  const [activeSiteId, setActiveSiteId] = useState(() => Storage.getActiveSiteId());
+  const activeSite = useMemo(() => sites.find((s) => s.id === activeSiteId) || sites[0] || null, [sites, activeSiteId]);
+  // 저장 effect들이 "지금 어떤 현장 데이터를 쓰고 있는지"를 항상 최신으로 참조하기 위한 ref.
+  // (state인 activeSiteId를 저장 effect의 deps에 넣으면, 현장 전환 시 아직 로드되지 않은
+  //  이전 현장의 데이터가 새 현장 키에 잘못 저장되는 경합이 생길 수 있어 ref로 분리함)
+  const currentSiteIdRef = useRef(activeSiteId);
+
+  const [buildingsExternal, setBuildingsExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.buildingsExternal, activeSiteId), BUILDINGS_EXTERNAL));
+  const [buildingsInternal, setBuildingsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), BUILDINGS_INTERNAL));
+  const [logsExternal, setLogsExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.logsExternal, activeSiteId), SEED_LOGS_EXTERNAL));
+  const [logsInternal, setLogsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), SEED_LOGS_INTERNAL));
+  const [pendingExternal, setPendingExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.pendingExternal, activeSiteId), []));
+  const [pendingInternal, setPendingInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
+  const [checklist, setChecklist] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
 
   // 동 목록은 고정 상수가 아니라 기준정보(엑셀 ①기준정보, 동기화로 갱신됨)에서 파생.
   // 현장이 바뀌어 엑셀의 기준정보(동 목록/계획수량 등)가 바뀌면 동기화 시 여기도 자동으로 갱신됨.
@@ -47,17 +56,37 @@ export default function App() {
   const [recoveryDong, setRecoveryDong] = useState(() => dongListExternal[0] || "");
 
   const [account, setAccount] = useState(null);
-  const [sync, setSync] = useState({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.KEYS.fileMeta, {})?.lastSyncedAt || null });
+  const [justLoggedIn, setJustLoggedIn] = useState(false);
+  const [sync, setSync] = useState({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.siteKey(Storage.KEYS.fileMeta, activeSiteId), {})?.lastSyncedAt || null });
   const wbRef = useRef(null);
   const itemIdRef = useRef(null);
 
-  useEffect(() => { Storage.set(Storage.KEYS.buildingsExternal, buildingsExternal); }, [buildingsExternal]);
-  useEffect(() => { Storage.set(Storage.KEYS.buildingsInternal, buildingsInternal); }, [buildingsInternal]);
-  useEffect(() => { Storage.set(Storage.KEYS.logsExternal, logsExternal); }, [logsExternal]);
-  useEffect(() => { Storage.set(Storage.KEYS.logsInternal, logsInternal); }, [logsInternal]);
-  useEffect(() => { Storage.set(Storage.KEYS.pendingExternal, pendingExternal); }, [pendingExternal]);
-  useEffect(() => { Storage.set(Storage.KEYS.pendingInternal, pendingInternal); }, [pendingInternal]);
-  useEffect(() => { Storage.set(Storage.KEYS.checklist, checklist); }, [checklist]);
+  // 현장을 전환하면 해당 현장의 데이터를 다시 불러옴. (마이그레이션으로 생성된 "기본 현장"만
+  // 기존 시드 데이터를 기본값으로 쓰고, 새로 추가한 현장은 빈 상태에서 시작해 동기화로 채워짐)
+  useEffect(() => {
+    if (!activeSiteId) return;
+    currentSiteIdRef.current = activeSiteId;
+    const site = Storage.getSites().find((s) => s.id === activeSiteId);
+    const isDefaultSite = !!site?.isDefault;
+    setBuildingsExternal(Storage.get(Storage.siteKey(Storage.KEYS.buildingsExternal, activeSiteId), isDefaultSite ? BUILDINGS_EXTERNAL : []));
+    setBuildingsInternal(Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), isDefaultSite ? BUILDINGS_INTERNAL : []));
+    setLogsExternal(Storage.get(Storage.siteKey(Storage.KEYS.logsExternal, activeSiteId), isDefaultSite ? SEED_LOGS_EXTERNAL : []));
+    setLogsInternal(Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), isDefaultSite ? SEED_LOGS_INTERNAL : []));
+    setPendingExternal(Storage.get(Storage.siteKey(Storage.KEYS.pendingExternal, activeSiteId), []));
+    setPendingInternal(Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
+    setChecklist(Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
+    setSync({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.siteKey(Storage.KEYS.fileMeta, activeSiteId), {})?.lastSyncedAt || null });
+    wbRef.current = null;
+    itemIdRef.current = null;
+  }, [activeSiteId]);
+
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.buildingsExternal, currentSiteIdRef.current), buildingsExternal); }, [buildingsExternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.buildingsInternal, currentSiteIdRef.current), buildingsInternal); }, [buildingsInternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.logsExternal, currentSiteIdRef.current), logsExternal); }, [logsExternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.logsInternal, currentSiteIdRef.current), logsInternal); }, [logsInternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.pendingExternal, currentSiteIdRef.current), pendingExternal); }, [pendingExternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.pendingInternal, currentSiteIdRef.current), pendingInternal); }, [pendingInternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklist, currentSiteIdRef.current), checklist); }, [checklist]);
 
   // 기준정보 동기화로 동 목록이 바뀌어 현재 선택값이 더 이상 유효하지 않으면 새 목록의 첫 항목으로 보정
   useEffect(() => {
@@ -77,11 +106,23 @@ export default function App() {
 
   useEffect(() => {
     if (!Graph.isConfigured()) return;
-    Graph.initMsal().then(() => {
+    Graph.initMsal().then((result) => {
       const acc = Graph.getActiveAccount();
       if (acc) setAccount(acc);
+      // 리다이렉트 로그인에서 막 돌아온 경우(result.account 존재) 자동으로 동기화 1회 실행
+      if (result?.account) setJustLoggedIn(true);
     }).catch(() => {});
   }, []);
+
+  // account가 막 설정된 직후(리다이렉트 로그인 복귀) 동기화를 한 번 트리거.
+  // useEffect로 분리한 이유: mount 시점 effect의 클로저는 account를 항상 null로 캡처하므로
+  // setAccount 직후 곧바로 runSync()를 호출하면 stale closure 때문에 동작하지 않음.
+  useEffect(() => {
+    if (justLoggedIn && account) {
+      setJustLoggedIn(false);
+      runSync();
+    }
+  }, [justLoggedIn, account]);
 
   const dashExternal = useMemo(() => calcExternalDashboard(buildingsExternal, logsExternal), [buildingsExternal, logsExternal]);
   const dashInternal = useMemo(() => calcInternalDashboard(buildingsInternal, logsInternal), [buildingsInternal, logsInternal]);
@@ -91,10 +132,10 @@ export default function App() {
 
   async function doLogin() {
     try {
-      setSync((s) => ({ ...s, state: "syncing", message: "로그인 중..." }));
-      const acc = await Graph.login();
-      setAccount(acc);
-      await runSync();
+      setSync((s) => ({ ...s, state: "syncing", message: "Microsoft 로그인 화면으로 이동 중..." }));
+      // loginRedirect는 페이지를 이동시키므로 이 함수는 보통 끝까지 실행되지 않습니다.
+      // 로그인 후 돌아오면 위쪽의 justLoggedIn 효과가 계정 설정과 동기화를 처리합니다.
+      await Graph.login();
     } catch (e) {
       setSync((s) => ({ ...s, state: "error", message: String(e.message || e) }));
     }
@@ -107,10 +148,10 @@ export default function App() {
   }
 
   async function runSync() {
-    if (!account) return;
+    if (!account || !activeSite) return;
     setSync((s) => ({ ...s, state: "syncing", message: "OneDrive에서 받아오는 중..." }));
     try {
-      const result = await Graph.syncDown();
+      const result = await Graph.syncDown(activeSite);
       let wb = result.wb;
       const itemId = result.itemId;
 
@@ -138,11 +179,40 @@ export default function App() {
 
       const now = new Date().toISOString();
       setSync({ state: "done", message: "동기화 완료", lastSyncedAt: now });
-      const meta = Storage.get(Storage.KEYS.fileMeta, {});
-      Storage.set(Storage.KEYS.fileMeta, { ...meta, lastSyncedAt: now });
+      const fileMetaKey = Storage.siteKey(Storage.KEYS.fileMeta, activeSite.id);
+      const meta = Storage.get(fileMetaKey, {});
+      Storage.set(fileMetaKey, { ...meta, lastSyncedAt: now });
     } catch (e) {
       setSync((s) => ({ ...s, state: "error", message: String(e.message || e) }));
     }
+  }
+
+  // ---- 현장 관리 ----
+  function selectSite(id) {
+    Storage.setActiveSiteId(id);
+    setActiveSiteId(id);
+  }
+
+  function handleAddSite(name, filePath) {
+    const site = Storage.addSite({ name, filePath });
+    setSites(Storage.getSites());
+    selectSite(site.id);
+  }
+
+  function handleUpdateSite(id, name, filePath) {
+    Storage.updateSite(id, { name, filePath });
+    setSites(Storage.getSites());
+    if (id === activeSiteId) {
+      // 경로가 바뀌었으니 캐시된 워크북/itemId를 비워 다음 동기화 때 새 경로로 다시 찾게 함
+      wbRef.current = null;
+      itemIdRef.current = null;
+    }
+  }
+
+  function handleDeleteSite(id) {
+    Storage.removeSite(id);
+    setSites(Storage.getSites());
+    if (id === activeSiteId) setActiveSiteId(Storage.getActiveSiteId());
   }
 
   function saveExternal() {
@@ -196,6 +266,15 @@ export default function App() {
     <div className="app">
       <div className="header">
         <h1>🪨 석공사 공정관리</h1>
+        <select
+          className="sitepicker"
+          value={activeSiteId || ""}
+          onChange={(e) => selectSite(e.target.value)}
+        >
+          {sites.map((s) => (
+            <option key={s.id} value={s.id}>🏗 {s.name}</option>
+          ))}
+        </select>
         <div className="sub">
           {account ? (
             <span className="pill dot-ok">🟢 {account.username}</span>
@@ -235,8 +314,15 @@ export default function App() {
             account={account} sync={sync} pendingCount={pendingCount}
             doLogin={doLogin} doLogout={doLogout} runSync={runSync}
             configured={Graph.isConfigured()}
+            sites={sites} activeSiteId={activeSiteId} activeSite={activeSite}
+            onSelectSite={selectSite} onAddSite={handleAddSite}
+            onUpdateSite={handleUpdateSite} onDeleteSite={handleDeleteSite}
           />
         )}
+        <div style={{ textAlign: "center", fontSize: 11, color: "#9ca3af", padding: "18px 8px 4px", lineHeight: 1.5 }}>
+          만든이 폭풍간지 이상준 01045166010 무분별 사용시 법적소송을 당할수있음.<br />
+          법적소송을 감당할수 있으면 승인받지 말고 쓸것
+        </div>
       </div>
 
       <div className="tabbar">
@@ -560,7 +646,10 @@ function BaseTab({ buildingsExternal, buildingsInternal }) {
   );
 }
 
-function SyncTab({ account, sync, pendingCount, doLogin, doLogout, runSync, configured }) {
+function SyncTab({
+  account, sync, pendingCount, doLogin, doLogout, runSync, configured,
+  sites, activeSiteId, activeSite, onSelectSite, onAddSite, onUpdateSite, onDeleteSite,
+}) {
   return (
     <div>
       {!configured && (
@@ -568,10 +657,16 @@ function SyncTab({ account, sync, pendingCount, doLogin, doLogout, runSync, conf
           Microsoft 앱 등록(Client ID)이 아직 설정되지 않았습니다. Azure 앱 등록 가이드를 먼저 진행해주세요. 등록 후 .env의 VITE_MSAL_CLIENT_ID 값을 채우면 OneDrive 연결이 가능합니다.
         </div>
       )}
+
+      <SiteManager
+        sites={sites} activeSiteId={activeSiteId}
+        onSelect={onSelectSite} onAdd={onAddSite} onUpdate={onUpdateSite} onDelete={onDeleteSite}
+      />
+
       <div className="card">
         <h2>OneDrive 연동</h2>
         <p style={{ fontSize: 13, color: "#6b7280", lineHeight: 1.5 }}>
-          데스크탑의 석공사_일일공정관리_lsj.xlsx 파일과 동기화합니다. 모바일에서 입력 후 저장하면 자동으로 이 파일에 새 행이 추가됩니다.
+          현재 선택된 현장(<b>{activeSite?.name}</b>)은 OneDrive의 "{activeSite?.filePath}" 파일과 동기화합니다(데스크탑 파일이 아니라 OneDrive에 저장된 파일 기준입니다). 모바일에서 입력 후 저장하면 자동으로 이 파일에 새 행이 추가됩니다. Microsoft 계정 연결은 모든 현장에 공통으로 적용되며, 현장마다 OneDrive 파일 경로만 다르게 지정하면 됩니다.
         </p>
         {account ? (
           <>
@@ -592,10 +687,90 @@ function SyncTab({ account, sync, pendingCount, doLogin, doLogout, runSync, conf
         <h3>알아두실 점</h3>
         <p style={{ fontSize: 12.5, color: "#6b7280", lineHeight: 1.6 }}>
           개인 OneDrive 계정은 엑셀 셀 단위 API를 지원하지 않아, 동기화 시 파일 전체를 받아 수정 후 다시 업로드합니다.
-          동기화 중에는 데스크탑에서 같은 파일을 열어두지 않는 것을 권장합니다(동시 저장 시 충돌 가능).
-          서식·색상 등 일부 디자인은 동기화 과정에서 미세하게 달라질 수 있습니다.
+          동기화 중에는 PC에서 OneDrive 동기화 중인 같은 파일을 열어두지 않는 것을 권장합니다(동시 저장 시 충돌 가능).
+          서식·색상 등 일부 디자인은 동기화 과정에서 미세하게 달라질 수 있습니다. 현장을 추가할 때도 같은 형식(①기준정보·②일일실적입력 시트 구조)의 엑셀 파일이어야 합니다.
         </p>
       </div>
+    </div>
+  );
+}
+
+function SiteManager({ sites, activeSiteId, onSelect, onAdd, onUpdate, onDelete }) {
+  const [editingId, setEditingId] = useState(null); // "new" | site.id | null
+  const [name, setName] = useState("");
+  const [filePath, setFilePath] = useState("");
+
+  function startAdd() {
+    setEditingId("new");
+    setName("");
+    setFilePath("");
+  }
+  function startEdit(site) {
+    setEditingId(site.id);
+    setName(site.name);
+    setFilePath(site.filePath);
+  }
+  function cancelForm() {
+    setEditingId(null);
+    setName("");
+    setFilePath("");
+  }
+  function submitForm() {
+    const trimmedName = name.trim();
+    const trimmedPath = filePath.trim();
+    if (!trimmedName || !trimmedPath) return;
+    if (editingId === "new") onAdd(trimmedName, trimmedPath);
+    else if (editingId) onUpdate(editingId, trimmedName, trimmedPath);
+    cancelForm();
+  }
+
+  return (
+    <div className="card">
+      <h2>현장 관리</h2>
+      <div className="sitelist">
+        {sites.map((s) => (
+          <div key={s.id} className={`siteitem${s.id === activeSiteId ? " active" : ""}`}>
+            <div className="siteinfo" onClick={() => onSelect(s.id)}>
+              <div className="sitename">{s.id === activeSiteId ? "🟢 " : ""}{s.name}</div>
+              <div className="sitepath">{s.filePath}</div>
+            </div>
+            <div className="siteactions">
+              <button className="btn btn-ghost btn-sm" onClick={() => startEdit(s)}>수정</button>
+              <button
+                className="btn btn-ghost btn-sm"
+                disabled={sites.length <= 1}
+                onClick={() => {
+                  if (window.confirm(`"${s.name}" 현장을 삭제할까요?\n이 기기에 저장된 해당 현장의 입력 데이터가 삭제됩니다. (OneDrive의 엑셀 파일 자체는 삭제되지 않습니다)`)) {
+                    onDelete(s.id);
+                  }
+                }}
+              >
+                삭제
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {editingId ? (
+        <div style={{ background: "#fafbff", border: "1px solid var(--line)", borderRadius: 10, padding: 12 }}>
+          <Field label="현장명">
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="예: ○○아파트 신축공사" />
+          </Field>
+          <Field label="OneDrive 파일 경로 (루트 기준)">
+            <input value={filePath} onChange={(e) => setFilePath(e.target.value)} placeholder="예: 2. 근무지_현장정리/4. ○○현장/석공사_일일공정관리.xlsx" />
+          </Field>
+          <p style={{ fontSize: 11.5, color: "#9aa0a8", margin: "0 0 10px" }}>
+            OneDrive 앱에서 해당 엑셀 파일의 경로(위치)를 그대로 입력하세요. 파일 형식·시트 구조(①기준정보, ②일일실적입력)는 기존과 동일해야 합니다.
+          </p>
+          <div className="row">
+            <button className="btn btn-ghost" onClick={cancelForm}>취소</button>
+            <button className="btn btn-primary" onClick={submitForm}>{editingId === "new" ? "추가" : "저장"}</button>
+          </div>
+        </div>
+      ) : (
+        <button className="btn btn-ghost" style={{ width: "100%" }} onClick={startAdd}>+ 새 현장 추가</button>
+      )}
     </div>
   );
 }
