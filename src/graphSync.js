@@ -6,7 +6,9 @@ import { Storage } from "./storage";
 // VITE_MSAL_CLIENT_ID는 Azure Portal에서 앱 등록 후 발급되는 "애플리케이션(클라이언트) ID"를
 // .env(또는 Vercel 환경변수)에 넣어야 합니다. 등록 전에는 로그인 버튼이 비활성화됩니다.
 const CLIENT_ID = import.meta.env.VITE_MSAL_CLIENT_ID || "";
-const FILE_NAME = import.meta.env.VITE_GRAPH_FILE_NAME || "석공사_일일공정관리_lsj.xlsx";
+// 어떤 OneDrive 파일과 동기화할지는 더 이상 전역 상수가 아니라 현장(site)별로 다릅니다.
+// 각 함수는 { id, name, filePath, fileName } 형태의 site 객체를 받아 처리합니다.
+// (filePath: OneDrive 루트 기준 경로, fileName: 경로의 마지막 파일명 — 검색 폴백용)
 
 const msalConfig = {
   auth: {
@@ -37,9 +39,12 @@ export function isConfigured() {
 export async function initMsal() {
   const inst = getMsal();
   await inst.initialize();
-  // 리다이렉트 로그인 사용 시 결과 처리 (팝업 사용 시에는 큰 영향 없음)
-  await inst.handleRedirectPromise().catch(() => null);
-  return inst;
+  // 모바일 인앱 브라우저(카카오톡/네이버 등)에서는 팝업이 "block_nested_popups"로
+  // 차단되므로 로그인은 리다이렉트 방식을 사용합니다. 리다이렉트로 로그인 후
+  // 돌아왔을 때 여기서 결과를 처리하고 활성 계정으로 설정합니다.
+  const result = await inst.handleRedirectPromise().catch(() => null);
+  if (result?.account) inst.setActiveAccount(result.account);
+  return result;
 }
 
 export function getActiveAccount() {
@@ -50,15 +55,15 @@ export function getActiveAccount() {
 
 export async function login() {
   const inst = getMsal();
-  const result = await inst.loginPopup({ scopes: SCOPES });
-  inst.setActiveAccount(result.account);
-  return result.account;
+  // 팝업 대신 리다이렉트: 페이지가 Microsoft 로그인 화면으로 이동했다가 돌아오면
+  // initMsal()의 handleRedirectPromise가 로그인 결과를 처리합니다.
+  await inst.loginRedirect({ scopes: SCOPES });
 }
 
 export function logout() {
   const inst = getMsal();
   const account = getActiveAccount();
-  if (account) inst.logoutPopup({ account });
+  if (account) inst.logoutRedirect({ account });
 }
 
 export async function getToken() {
@@ -69,8 +74,9 @@ export async function getToken() {
     const res = await inst.acquireTokenSilent({ scopes: SCOPES, account });
     return res.accessToken;
   } catch {
-    const res = await inst.acquireTokenPopup({ scopes: SCOPES, account });
-    return res.accessToken;
+    // 자동(무인) 토큰 갱신 실패 시에도 팝업 대신 리다이렉트로 재인증합니다.
+    await inst.acquireTokenRedirect({ scopes: SCOPES, account });
+    throw new Error("REDIRECTING_FOR_TOKEN");
   }
 }
 
@@ -94,15 +100,46 @@ async function graphFetch(url, token, opts = {}) {
   return res;
 }
 
-export async function findFileId(token) {
-  const cached = Storage.get(Storage.KEYS.fileMeta, null);
-  if (cached?.itemId) return cached.itemId;
-  const q = encodeURIComponent(FILE_NAME);
+export async function findFileId(token, site) {
+  const fileMetaKey = Storage.siteKey(Storage.KEYS.fileMeta, site.id);
+
+  // 캐시된 itemId가 있어도 무조건 신뢰하지 않고, 실제로 같은 파일을 가리키는지 먼저 확인합니다.
+  // (예전에 잘못 캐시된 값이 영구히 남아 동기화가 계속 실패하는 문제를 방지)
+  const cached = Storage.get(fileMetaKey, null);
+  if (cached?.itemId) {
+    try {
+      const res = await fetch(`${GRAPH}/me/drive/items/${cached.itemId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const meta = await res.json();
+        if (meta.name === site.fileName) return cached.itemId;
+      }
+    } catch {
+      // 확인 실패 시 무시하고 아래에서 다시 찾음
+    }
+  }
+
+  // 1) OneDrive 내 정확한 경로로 직접 조회 (검색 인덱싱 지연과 무관하게 항상 정확)
+  try {
+    const encodedPath = site.filePath.split("/").map(encodeURIComponent).join("/");
+    const res = await graphFetch(`${GRAPH}/me/drive/root:/${encodedPath}`, token);
+    const json = await res.json();
+    if (json?.id) {
+      Storage.set(fileMetaKey, { itemId: json.id, name: json.name, webUrl: json.webUrl });
+      return json.id;
+    }
+  } catch {
+    // 경로가 바뀌었거나 조회 실패 시 아래 검색으로 폴백
+  }
+
+  // 2) 파일명으로 전체 OneDrive 검색 (폴더 구조가 바뀐 경우의 대비책)
+  const q = encodeURIComponent(site.fileName);
   const res = await graphFetch(`${GRAPH}/me/drive/root/search(q='${q}')`, token);
   const json = await res.json();
-  const match = (json.value || []).find((it) => it.name === FILE_NAME) || (json.value || [])[0];
-  if (!match) throw new Error(`OneDrive에서 "${FILE_NAME}" 파일을 찾을 수 없습니다.`);
-  Storage.set(Storage.KEYS.fileMeta, { itemId: match.id, name: match.name, webUrl: match.webUrl });
+  const match = (json.value || []).find((it) => it.name === site.fileName) || (json.value || [])[0];
+  if (!match) throw new Error(`OneDrive에서 "${site.fileName}" 파일을 찾을 수 없습니다. (경로: ${site.filePath})`);
+  Storage.set(fileMetaKey, { itemId: match.id, name: match.name, webUrl: match.webUrl });
   return match.id;
 }
 
@@ -311,9 +348,10 @@ export function appendInternalRow(wb, entry) {
 }
 
 // 전체 흐름: 로그인 → 다운로드 → 파싱 → 앱 상태 반환 (워크북 객체도 함께 보관해야 재업로드 가능)
-export async function syncDown() {
+// site: { id, name, filePath, fileName } — 어떤 현장의 OneDrive 파일을 동기화할지 지정
+export async function syncDown(site) {
   const token = await getToken();
-  const itemId = await findFileId(token);
+  const itemId = await findFileId(token, site);
   const buf = await downloadWorkbookArrayBuffer(token, itemId);
   const wb = parseWorkbook(buf);
   const buildings = readBuildings(wb);

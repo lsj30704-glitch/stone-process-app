@@ -37,6 +37,18 @@ body {
 }
 .header h1 { font-size: 17px; margin: 0 0 4px; font-weight: 700; }
 .header .sub { font-size: 12px; opacity: 0.9; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.header select.sitepicker {
+  width: auto;
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 4px 8px;
+  margin: 0 0 6px;
+  border: 1px solid rgba(255,255,255,0.4);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.16);
+  color: var(--brand-ink);
+}
+.header select.sitepicker option { color: var(--ink); }
 
 .tabbar {
   position: fixed;
@@ -156,3 +168,11 @@ table.dashtable td.dong { text-align: left; font-weight: 700; }
 .banner.info { background: #e8f0fe; color: #1d4ed8; }
 .banner.warn { background: #fff4e0; color: #92600a; }
 .banner.error { background: #fde8e8; color: #c0392b; }
+
+.sitelist { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+.siteitem { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px; background: #fafbff; border: 1px solid var(--line); border-radius: 10px; }
+.siteitem.active { border-color: var(--brand); background: #eef4ff; }
+.siteitem .siteinfo { flex: 1; min-width: 0; cursor: pointer; }
+.siteitem .sitename { font-size: 13px; font-weight: 700; }
+.siteitem .sitepath { font-size: 11px; color: var(--sub); word-break: break-all; margin-top: 2px; }
+.siteitem .siteactions { display: flex; gap: 6px; flex-shrink: 0; }
