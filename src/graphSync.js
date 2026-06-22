@@ -1,5 +1,5 @@
 import { PublicClientApplication } from "@azure/msal-browser";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import { Storage } from "./storage";
 
 // ---- MSAL 설정 ----
@@ -83,8 +83,13 @@ export async function getToken() {
 // ---- Graph 파일 탐색/다운로드/업로드 ----
 // 주의: Microsoft Graph의 Excel "workbook" REST API(셀 단위 읽기/쓰기)는
 // 개인(Consumer) OneDrive 계정에서는 지원되지 않습니다.
-// 그래서 파일 전체를 받아(content) 브라우저에서 SheetJS로 수정한 뒤
+// 그래서 파일 전체를 받아(content) 브라우저에서 수정한 뒤
 // 파일 전체를 다시 업로드(content)하는 방식으로 동작합니다.
+//
+// [중요] 예전에는 이 수정을 SheetJS(xlsx)로 했는데, SheetJS 무료판은 쓰기 시
+// 셀 채움색·글꼴 등 서식을 보존하지 못하고 줄바꿈을 "_x000D_"로 깨뜨립니다.
+// 그래서 서식·메모·데이터유효성·조건부서식을 모두 보존하는 ExcelJS로 교체했습니다.
+// 우리는 "값만" 입력 행에 채우고, 기존 템플릿 행의 서식은 그대로 두므로 색이 깨지지 않습니다.
 
 const GRAPH = "https://graph.microsoft.com/v1.0";
 
@@ -156,12 +161,58 @@ export async function uploadWorkbookArrayBuffer(token, itemId, arrayBuffer) {
   });
 }
 
-export function parseWorkbook(arrayBuffer) {
-  return XLSX.read(arrayBuffer, { type: "array", cellFormula: true, cellStyles: true, cellDates: true });
+// ---- ExcelJS 워크북 로드/직렬화 ----
+
+export async function parseWorkbook(arrayBuffer) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(arrayBuffer);
+  return wb;
 }
 
-export function serializeWorkbook(wb) {
-  return XLSX.write(wb, { type: "array", bookType: "xlsx", cellStyles: true });
+// ExcelJS는 데이터 유효성(드롭다운)을 셀 단위로 들고 있다가 저장 시 범위로 묶는데,
+// 이때 같은 범위가 중복(C5:C104 + C10:C104처럼 겹침)으로 출력되어 Excel이
+// "파일을 복구해야 합니다" 경고를 띄울 수 있습니다. 저장 직전에 열·규칙별로 하나의
+// 연속 범위로 정리해 중복을 제거합니다.
+function normalizeDataValidations(ws) {
+  const dv = ws.dataValidations;
+  if (!dv || !dv.model) return;
+  const model = dv.model;
+  const addrs = Object.keys(model);
+  if (!addrs.length) return;
+
+  const groups = {};
+  for (const addr of addrs) {
+    if (addr.indexOf(":") !== -1) {
+      // 이미 범위 형태면 그대로 보존
+      groups[`${addr}__range`] = { rangeKey: addr, rule: model[addr] };
+      continue;
+    }
+    const col = addr.replace(/[0-9]/g, "");
+    const rowNum = parseInt(addr.replace(/[^0-9]/g, ""), 10);
+    const sig = `${col}||${JSON.stringify(model[addr])}`;
+    if (!groups[sig]) groups[sig] = { col, rows: [], rule: model[addr] };
+    groups[sig].rows.push(rowNum);
+  }
+
+  const next = {};
+  for (const key in groups) {
+    const g = groups[key];
+    if (g.rangeKey) {
+      next[g.rangeKey] = g.rule;
+      continue;
+    }
+    g.rows.sort((a, b) => a - b);
+    const lo = g.rows[0];
+    const hi = g.rows[g.rows.length - 1];
+    next[`${g.col}${lo}:${g.col}${hi}`] = g.rule;
+  }
+  dv.model = next;
+}
+
+export async function serializeWorkbook(wb) {
+  for (const ws of wb.worksheets) normalizeDataValidations(ws);
+  // ArrayBuffer 반환 (Graph 업로드 body로 그대로 사용)
+  return await wb.xlsx.writeBuffer();
 }
 
 // ---- 시트 ↔ 앱 데이터 변환 ----
@@ -170,91 +221,113 @@ const SHEET_EXTERNAL = "②일일실적입력";
 const SHEET_INTERNAL = "②일일실적입력(내부)";
 const SHEET_BASE = "①기준정보";
 
+// ExcelJS 셀 값을 단순 원시값(문자열/숫자/Date/null)으로 정규화.
+// - 수식 셀: { formula, result } → result
+// - 하이퍼링크: { text, hyperlink } → text
+// - 서식있는 텍스트: { richText:[...] } → 텍스트 합치기
+function rawCell(ws, addr) {
+  const v = ws.getCell(addr).value;
+  if (v === null || v === undefined) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === "object") {
+    if ("result" in v) {
+      const r = v.result;
+      // 수식 결과가 에러 객체({error})인 경우 빈값 처리
+      return r && typeof r === "object" ? "" : r ?? "";
+    }
+    if ("text" in v) return v.text ?? "";
+    if (Array.isArray(v.richText)) return v.richText.map((t) => t.text).join("");
+    return "";
+  }
+  return v;
+}
+
 function excelDateToISO(v) {
   if (v instanceof Date) return v.toISOString().slice(0, 10);
   if (typeof v === "number") {
-    const d = XLSX.SSF.parse_date_code(v);
-    return `${d.y}-${String(d.m).padStart(2, "0")}-${String(d.d).padStart(2, "0")}`;
+    // 엑셀 일련번호(1900 체계) → ISO 날짜
+    const ms = Math.round((v - 25569) * 86400 * 1000);
+    return new Date(ms).toISOString().slice(0, 10);
   }
   return v || "";
 }
 
 export function readExternalLogs(wb) {
-  const ws = wb.Sheets[SHEET_EXTERNAL];
+  const ws = wb.getWorksheet(SHEET_EXTERNAL);
   if (!ws) return [];
   const out = [];
   for (let r = 5; r <= 104; r++) {
-    const bCell = ws[`B${r}`];
-    if (!bCell || bCell.v === undefined || bCell.v === "") continue;
+    const b = rawCell(ws, `B${r}`);
+    if (b === null || b === "") continue;
     out.push({
       id: `row-${r}`,
       row: r,
-      date: excelDateToISO(bCell.v),
-      dong: ws[`C${r}`]?.v ?? "",
-      masonry: ws[`D${r}`]?.v ?? 0,
-      caulking: ws[`E${r}`]?.v ?? 0,
-      truss: ws[`F${r}`]?.v ?? 0,
-      scaffold: ws[`G${r}`]?.v ?? 0,
-      actual: ws[`J${r}`]?.v ?? "",
-      disaster: ws[`L${r}`]?.v ?? "",
-      reason: ws[`M${r}`]?.v ?? "",
-      note: ws[`N${r}`]?.v ?? "",
-      memo: ws[`O${r}`]?.v ?? "",
+      date: excelDateToISO(b),
+      dong: rawCell(ws, `C${r}`) ?? "",
+      masonry: rawCell(ws, `D${r}`) ?? 0,
+      caulking: rawCell(ws, `E${r}`) ?? 0,
+      truss: rawCell(ws, `F${r}`) ?? 0,
+      scaffold: rawCell(ws, `G${r}`) ?? 0,
+      actual: rawCell(ws, `J${r}`) ?? "",
+      disaster: rawCell(ws, `L${r}`) ?? "",
+      reason: rawCell(ws, `M${r}`) ?? "",
+      note: rawCell(ws, `N${r}`) ?? "",
+      memo: rawCell(ws, `O${r}`) ?? "",
     });
   }
   return out;
 }
 
 export function readInternalLogs(wb) {
-  const ws = wb.Sheets[SHEET_INTERNAL];
+  const ws = wb.getWorksheet(SHEET_INTERNAL);
   if (!ws) return [];
   const out = [];
   for (let r = 5; r <= 104; r++) {
-    const bCell = ws[`B${r}`];
-    if (!bCell || bCell.v === undefined || bCell.v === "") continue;
+    const b = rawCell(ws, `B${r}`);
+    if (b === null || b === "") continue;
     out.push({
       id: `row-${r}`,
       row: r,
-      date: excelDateToISO(bCell.v),
-      dong: ws[`C${r}`]?.v ?? "",
-      masonry: ws[`D${r}`]?.v ?? 0,
-      caulking: ws[`E${r}`]?.v ?? 0,
-      truss: ws[`F${r}`]?.v ?? 0,
-      actual: ws[`I${r}`]?.v ?? "",
-      disaster: ws[`K${r}`]?.v ?? "",
-      reason: ws[`L${r}`]?.v ?? "",
-      note: ws[`M${r}`]?.v ?? "",
-      memo: ws[`N${r}`]?.v ?? "",
+      date: excelDateToISO(b),
+      dong: rawCell(ws, `C${r}`) ?? "",
+      masonry: rawCell(ws, `D${r}`) ?? 0,
+      caulking: rawCell(ws, `E${r}`) ?? 0,
+      truss: rawCell(ws, `F${r}`) ?? 0,
+      actual: rawCell(ws, `I${r}`) ?? "",
+      disaster: rawCell(ws, `K${r}`) ?? "",
+      reason: rawCell(ws, `L${r}`) ?? "",
+      note: rawCell(ws, `M${r}`) ?? "",
+      memo: rawCell(ws, `N${r}`) ?? "",
     });
   }
   return out;
 }
 
 export function readBuildings(wb) {
-  const ws = wb.Sheets[SHEET_BASE];
+  const ws = wb.getWorksheet(SHEET_BASE);
   if (!ws) return { external: [], internal: [] };
   const external = [];
   for (let r = 6; r <= 13; r++) {
-    const dong = ws[`B${r}`]?.v;
+    const dong = rawCell(ws, `B${r}`);
     if (!dong) continue;
     external.push({
       dong,
-      totalArea: ws[`C${r}`]?.v ?? 0,
-      startDate: excelDateToISO(ws[`D${r}`]?.v),
-      endDate: excelDateToISO(ws[`E${r}`]?.v),
-      workDays: ws[`F${r}`]?.v ?? 0,
-      dailyPlan: ws[`G${r}`]?.v ?? 0,
-      baseWorkers: ws[`H${r}`]?.v ?? 0,
-      hoist: ws[`I${r}`]?.v ?? 0,
-      note: ws[`J${r}`]?.v ?? "",
+      totalArea: rawCell(ws, `C${r}`) ?? 0,
+      startDate: excelDateToISO(rawCell(ws, `D${r}`)),
+      endDate: excelDateToISO(rawCell(ws, `E${r}`)),
+      workDays: rawCell(ws, `F${r}`) ?? 0,
+      dailyPlan: rawCell(ws, `G${r}`) ?? 0,
+      baseWorkers: rawCell(ws, `H${r}`) ?? 0,
+      hoist: rawCell(ws, `I${r}`) ?? 0,
+      note: rawCell(ws, `J${r}`) ?? "",
     });
   }
   const internal = [];
   for (let r = 45; r <= 52; r++) {
-    const dong = ws[`B${r}`]?.v;
+    const dong = rawCell(ws, `B${r}`);
     if (!dong) continue;
-    const totalUnits = ws[`C${r}`]?.v ?? 0;
-    const optionUnits = ws[`D${r}`]?.v ?? 0;
+    const totalUnits = rawCell(ws, `C${r}`) ?? 0;
+    const optionUnits = rawCell(ws, `D${r}`) ?? 0;
     internal.push({ dong, totalUnits, optionUnits, normalUnits: totalUnits - optionUnits });
   }
   return { external, internal };
@@ -262,88 +335,74 @@ export function readBuildings(wb) {
 
 function findNextEmptyRow(ws, startRow = 5, endRow = 104) {
   for (let r = startRow; r <= endRow; r++) {
-    const bCell = ws[`B${r}`];
-    if (!bCell || bCell.v === undefined || bCell.v === "") return r;
+    const b = rawCell(ws, `B${r}`);
+    if (b === null || b === "") return r;
   }
   return null; // 시트가 가득 찼음
 }
 
-function extendRef(ws, row) {
-  const ref = XLSX.utils.decode_range(ws["!ref"]);
-  if (row > ref.e.r + 1) {
-    ref.e.r = row - 1;
-    ws["!ref"] = XLSX.utils.encode_range(ref);
-  }
-}
-
-function copyStyle(ws, fromAddr, toAddr) {
-  const from = ws[fromAddr];
-  if (from && from.s) {
-    if (!ws[toAddr]) ws[toAddr] = {};
-    ws[toAddr].s = from.s;
-  }
+// 입력 행은 템플릿(5~104행)에 이미 색·글꼴·표시형식이 들어 있으므로 "값만" 채웁니다.
+// (ExcelJS는 값을 설정해도 기존 셀 스타일을 유지하므로 색이 깨지지 않습니다.)
+// 날짜는 사용자의 로컬 타임존(예: KST)에서 하루 밀리지 않도록 UTC 자정으로 만듭니다.
+function setDateCell(ws, addr, isoDate, templateRow) {
+  const cell = ws.getCell(addr);
+  cell.value = new Date(`${isoDate}T00:00:00Z`);
+  // 혹시 표시형식이 비어 있으면 바로 윗 템플릿 행의 형식을 복사 (안전장치)
+  const col = addr.replace(/[0-9]/g, "");
+  const tmpl = ws.getCell(`${col}${templateRow}`);
+  if (!cell.numFmt && tmpl.numFmt) cell.numFmt = tmpl.numFmt;
 }
 
 // 새 외부 실적 행을 워크북에 추가 (값 + 기존과 동일한 수식 패턴)
 export function appendExternalRow(wb, entry) {
-  const ws = wb.Sheets[SHEET_EXTERNAL];
+  const ws = wb.getWorksheet(SHEET_EXTERNAL);
   if (!ws) throw new Error(`시트를 찾을 수 없습니다: ${SHEET_EXTERNAL}`);
   const row = findNextEmptyRow(ws);
   if (!row) throw new Error("일일실적입력 시트의 입력 가능한 행(5~104)이 모두 채워졌습니다.");
   const templateRow = row > 5 ? row - 1 : 5;
 
-  ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O"].forEach((col) =>
-    copyStyle(ws, `${col}${templateRow}`, `${col}${row}`)
-  );
+  ws.getCell(`A${row}`).value = row - 4;
+  setDateCell(ws, `B${row}`, entry.date, templateRow);
+  ws.getCell(`C${row}`).value = entry.dong;
+  ws.getCell(`D${row}`).value = Number(entry.masonry) || 0;
+  ws.getCell(`E${row}`).value = Number(entry.caulking) || 0;
+  ws.getCell(`F${row}`).value = Number(entry.truss) || 0;
+  ws.getCell(`G${row}`).value = Number(entry.scaffold) || 0;
+  ws.getCell(`H${row}`).value = { formula: `SUM(D${row}:G${row})` };
+  ws.getCell(`I${row}`).value = { formula: `IFERROR(IF(C${row}="","",VLOOKUP(C${row},①기준정보!$B$6:$G$13,6,0)),"")` };
+  ws.getCell(`J${row}`).value = entry.actual === "" || entry.actual === null ? 0 : Number(entry.actual);
+  ws.getCell(`K${row}`).value = { formula: `IFERROR(IF(OR(J${row}="",I${row}="",I${row}=0),"",J${row}/I${row}),"")` };
+  ws.getCell(`L${row}`).value = entry.disaster || "";
+  ws.getCell(`M${row}`).value = entry.reason || "";
+  ws.getCell(`N${row}`).value = entry.note || "";
+  ws.getCell(`O${row}`).value = entry.memo || "";
 
-  ws[`A${row}`] = { t: "n", v: row - 4 };
-  ws[`B${row}`] = { t: "d", v: new Date(entry.date + "T00:00:00"), z: ws[`B${templateRow}`]?.z || "yyyy-mm-dd" };
-  ws[`C${row}`] = { t: "s", v: entry.dong };
-  ws[`D${row}`] = { t: "n", v: Number(entry.masonry) || 0 };
-  ws[`E${row}`] = { t: "n", v: Number(entry.caulking) || 0 };
-  ws[`F${row}`] = { t: "n", v: Number(entry.truss) || 0 };
-  ws[`G${row}`] = { t: "n", v: Number(entry.scaffold) || 0 };
-  ws[`H${row}`] = { t: "n", f: `SUM(D${row}:G${row})` };
-  ws[`I${row}`] = { t: "n", f: `IFERROR(IF(C${row}="","",VLOOKUP(C${row},①기준정보!$B$6:$G$13,6,0)),"")` };
-  ws[`J${row}`] = { t: "n", v: entry.actual === "" || entry.actual === null ? 0 : Number(entry.actual) };
-  ws[`K${row}`] = { t: "n", f: `IFERROR(IF(OR(J${row}="",I${row}="",I${row}=0),"",J${row}/I${row}),"")` };
-  ws[`L${row}`] = { t: "s", v: entry.disaster || "" };
-  ws[`M${row}`] = { t: "s", v: entry.reason || "" };
-  ws[`N${row}`] = { t: "s", v: entry.note || "" };
-  ws[`O${row}`] = { t: "s", v: entry.memo || "" };
-
-  extendRef(ws, row);
   return row;
 }
 
 // 새 내부(세대) 실적 행을 워크북에 추가
 export function appendInternalRow(wb, entry) {
-  const ws = wb.Sheets[SHEET_INTERNAL];
+  const ws = wb.getWorksheet(SHEET_INTERNAL);
   if (!ws) throw new Error(`시트를 찾을 수 없습니다: ${SHEET_INTERNAL}`);
   const row = findNextEmptyRow(ws);
   if (!row) throw new Error("일일실적입력(내부) 시트의 입력 가능한 행(5~104)이 모두 채워졌습니다.");
   const templateRow = row > 5 ? row - 1 : 5;
 
-  ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N"].forEach((col) =>
-    copyStyle(ws, `${col}${templateRow}`, `${col}${row}`)
-  );
+  ws.getCell(`A${row}`).value = row - 4;
+  setDateCell(ws, `B${row}`, entry.date, templateRow);
+  ws.getCell(`C${row}`).value = entry.dong;
+  ws.getCell(`D${row}`).value = Number(entry.masonry) || 0;
+  ws.getCell(`E${row}`).value = Number(entry.caulking) || 0;
+  ws.getCell(`F${row}`).value = Number(entry.truss) || 0;
+  ws.getCell(`G${row}`).value = { formula: `SUM(D${row}:F${row})` };
+  ws.getCell(`H${row}`).value = { formula: `G${row}*3` };
+  ws.getCell(`I${row}`).value = entry.actual === "" || entry.actual === null ? 0 : Number(entry.actual);
+  ws.getCell(`J${row}`).value = { formula: `IFERROR(IF(OR(I${row}="",H${row}="",H${row}=0),"",I${row}/H${row}),"")` };
+  ws.getCell(`K${row}`).value = entry.disaster || "";
+  ws.getCell(`L${row}`).value = entry.reason || "";
+  ws.getCell(`M${row}`).value = entry.note || "";
+  ws.getCell(`N${row}`).value = entry.memo || "";
 
-  ws[`A${row}`] = { t: "n", v: row - 4 };
-  ws[`B${row}`] = { t: "d", v: new Date(entry.date + "T00:00:00"), z: ws[`B${templateRow}`]?.z || "yyyy-mm-dd" };
-  ws[`C${row}`] = { t: "s", v: entry.dong };
-  ws[`D${row}`] = { t: "n", v: Number(entry.masonry) || 0 };
-  ws[`E${row}`] = { t: "n", v: Number(entry.caulking) || 0 };
-  ws[`F${row}`] = { t: "n", v: Number(entry.truss) || 0 };
-  ws[`G${row}`] = { t: "n", f: `SUM(D${row}:F${row})` };
-  ws[`H${row}`] = { t: "n", f: `G${row}*3` };
-  ws[`I${row}`] = { t: "n", v: entry.actual === "" || entry.actual === null ? 0 : Number(entry.actual) };
-  ws[`J${row}`] = { t: "n", f: `IFERROR(IF(OR(I${row}="",H${row}="",H${row}=0),"",I${row}/H${row}),"")` };
-  ws[`K${row}`] = { t: "s", v: entry.disaster || "" };
-  ws[`L${row}`] = { t: "s", v: entry.reason || "" };
-  ws[`M${row}`] = { t: "s", v: entry.note || "" };
-  ws[`N${row}`] = { t: "s", v: entry.memo || "" };
-
-  extendRef(ws, row);
   return row;
 }
 
@@ -353,7 +412,7 @@ export async function syncDown(site) {
   const token = await getToken();
   const itemId = await findFileId(token, site);
   const buf = await downloadWorkbookArrayBuffer(token, itemId);
-  const wb = parseWorkbook(buf);
+  const wb = await parseWorkbook(buf);
   const buildings = readBuildings(wb);
   const logsExternal = readExternalLogs(wb);
   const logsInternal = readInternalLogs(wb);
@@ -362,7 +421,7 @@ export async function syncDown(site) {
 
 export async function syncUp(wb, itemId) {
   const token = await getToken();
-  const buf = serializeWorkbook(wb);
+  const buf = await serializeWorkbook(wb);
   await uploadWorkbookArrayBuffer(token, itemId, buf);
   return new Date().toISOString();
 }
