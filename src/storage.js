@@ -9,6 +9,14 @@ const KEYS = {
   buildingsInternal: "spm_buildings_internal_v1",
   logsExternal: "spm_logs_external_v1",
   logsInternal: "spm_logs_internal_v1",
+  // 추가 공사 범위(면적형) — 호이스트
+  buildingsHoist: "spm_buildings_hoist_v1",
+  logsHoist: "spm_logs_hoist_v1",
+  pendingHoist: "spm_pending_hoist_v1",
+  // 추가 공사 범위(면적형) — 부대시설
+  buildingsFacility: "spm_buildings_facility_v1",
+  logsFacility: "spm_logs_facility_v1",
+  pendingFacility: "spm_pending_facility_v1",
   fileMeta: "spm_file_meta_v1", // OneDrive 파일 id, 마지막 동기화 시각 등
   pendingExternal: "spm_pending_external_v1", // 아직 업로드 못한 외부 입력
   pendingInternal: "spm_pending_internal_v1",

@@ -354,6 +354,78 @@ export function readBuildings(wb) {
   return { external, internal };
 }
 
+// ===== 공사 범위(scope) 일반화 — 외부/호이스트/부대시설처럼 면적(m²)형 시트 공용 =====
+// 면적형 일일실적 시트(외부와 동일한 컬럼 구조)를 시트명만 받아 일반적으로 읽음.
+export function readAreaLogs(wb, sheetName) {
+  const ws = wb.getWorksheet(sheetName);
+  if (!ws) return [];
+  const out = [];
+  for (let r = 5; r <= 104; r++) {
+    const b = rawCell(ws, `B${r}`);
+    if (b === null || b === "") continue;
+    out.push({
+      id: `row-${r}`,
+      row: r,
+      date: excelDateToISO(b),
+      dong: rawCell(ws, `C${r}`) ?? "",
+      masonry: rawCell(ws, `D${r}`) ?? 0,
+      caulking: rawCell(ws, `E${r}`) ?? 0,
+      truss: rawCell(ws, `F${r}`) ?? 0,
+      scaffold: rawCell(ws, `G${r}`) ?? 0,
+      actual: rawCell(ws, `J${r}`) ?? "",
+      disaster: rawCell(ws, `L${r}`) ?? "",
+      reason: rawCell(ws, `M${r}`) ?? "",
+      note: rawCell(ws, `N${r}`) ?? "",
+      memo: rawCell(ws, `O${r}`) ?? "",
+    });
+  }
+  return out;
+}
+
+// 면적형 기준정보 블록을 "▶ ○○ 수량" 라벨로 찾아 읽음 (외부/호이스트/부대시설 공용).
+export function readAreaBuildings(wb, headerIncludes) {
+  const ws = wb.getWorksheet(SHEET_BASE);
+  if (!ws) return [];
+  return findBlockDataRows(ws, headerIncludes).map((r) => ({
+    dong: rawCell(ws, `B${r}`),
+    totalArea: rawCell(ws, `C${r}`) ?? 0,
+    startDate: excelDateToISO(rawCell(ws, `D${r}`)),
+    endDate: excelDateToISO(rawCell(ws, `E${r}`)),
+    workDays: rawCell(ws, `F${r}`) ?? 0,
+    dailyPlan: rawCell(ws, `G${r}`) ?? 0,
+    baseWorkers: rawCell(ws, `H${r}`) ?? 0,
+    hoist: rawCell(ws, `I${r}`) ?? 0,
+    note: rawCell(ws, `J${r}`) ?? "",
+  }));
+}
+
+// 면적형 시트에 새 행 추가 (시트명 + 계획수량 참조범위를 받아 일반화).
+// planRange 예: "①기준정보!$B$18:$G$25"
+export function appendAreaRow(wb, sheetName, planRange, entry) {
+  const ws = wb.getWorksheet(sheetName);
+  if (!ws) throw new Error(`시트를 찾을 수 없습니다: ${sheetName}`);
+  const row = findNextEmptyRow(ws);
+  if (!row) throw new Error(`${sheetName} 시트의 입력 가능한 행(5~104)이 모두 채워졌습니다.`);
+  const templateRow = row > 5 ? row - 1 : 5;
+
+  ws.getCell(`A${row}`).value = row - 4;
+  setDateCell(ws, `B${row}`, entry.date, templateRow);
+  ws.getCell(`C${row}`).value = entry.dong;
+  ws.getCell(`D${row}`).value = Number(entry.masonry) || 0;
+  ws.getCell(`E${row}`).value = Number(entry.caulking) || 0;
+  ws.getCell(`F${row}`).value = Number(entry.truss) || 0;
+  ws.getCell(`G${row}`).value = Number(entry.scaffold) || 0;
+  ws.getCell(`H${row}`).value = { formula: `SUM(D${row}:G${row})` };
+  ws.getCell(`I${row}`).value = { formula: `IFERROR(IF(C${row}="","",VLOOKUP(C${row},${planRange},6,0)),"")` };
+  ws.getCell(`J${row}`).value = entry.actual === "" || entry.actual === null ? 0 : Number(entry.actual);
+  ws.getCell(`K${row}`).value = { formula: `IFERROR(IF(OR(J${row}="",I${row}="",I${row}=0),"",J${row}/I${row}),"")` };
+  ws.getCell(`L${row}`).value = entry.disaster || "";
+  ws.getCell(`M${row}`).value = entry.reason || "";
+  ws.getCell(`N${row}`).value = entry.note || "";
+  ws.getCell(`O${row}`).value = entry.memo || "";
+  return row;
+}
+
 function findNextEmptyRow(ws, startRow = 5, endRow = 104) {
   for (let r = startRow; r <= endRow; r++) {
     const b = rawCell(ws, `B${r}`);

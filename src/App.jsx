@@ -5,7 +5,7 @@ import {
 } from "./data";
 import {
   calcRowExternal, calcRowInternal, calcExternalDashboard, calcInternalDashboard,
-  calcRecoveryPlan, statusBadge, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
+  calcRecoveryPlan, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
 } from "./calc";
 import { Storage } from "./storage";
 import * as Graph from "./graphSync";
@@ -17,43 +17,78 @@ function today() {
 // 내부(세대) 동 목록에는 기준정보(엑셀)에 세대수가 없는 특수 구역도 선택할 수 있게 항상 추가해줌
 const EXTRA_INTERNAL_DONG = "게스트하우스";
 
-function emptyExternalForm(dongList) {
+// ===== 공사 범위(scope) 정의 =====
+// 면적(m²)형 공사 범위 — 외부/호이스트/부대시설은 동일한 시트 구조라 같은 계산 로직을 공유.
+// 새 면적형 범위가 생기면 엑셀에 시트(②일일실적입력(○○))와 기준정보 블록(▶ ○○ 수량)을 추가하고
+// 여기에 한 줄만 더 넣으면 앱 화면에 자동으로 추가됩니다.
+const AREA_SCOPES = [
+  { key: "external", label: "외부(아파트)", sheet: "②일일실적입력", planLabel: "동별 시공 계획 수량", planRange: "①기준정보!$B$6:$G$13" },
+  { key: "hoist", label: "호이스트", sheet: "②일일실적입력(호이스트)", planLabel: "호이스트 시공 계획 수량", planRange: "①기준정보!$B$18:$G$25" },
+  { key: "facility", label: "부대시설", sheet: "②일일실적입력(부대시설)", planLabel: "부대시설 계획 수량", planRange: "①기준정보!$B$30:$G$37" },
+];
+const AREA_KEYS = AREA_SCOPES.map((s) => s.key);
+const AREA_STORAGE = {
+  external: { b: Storage.KEYS.buildingsExternal, l: Storage.KEYS.logsExternal, p: Storage.KEYS.pendingExternal },
+  hoist: { b: Storage.KEYS.buildingsHoist, l: Storage.KEYS.logsHoist, p: Storage.KEYS.pendingHoist },
+  facility: { b: Storage.KEYS.buildingsFacility, l: Storage.KEYS.logsFacility, p: Storage.KEYS.pendingFacility },
+};
+// 입력/현황 화면의 범위 전환 탭 (면적형 범위들 + 내부(세대))
+const SCOPE_TABS = [...AREA_SCOPES.map((s) => ({ key: s.key, label: s.label })), { key: "internal", label: "내부(세대)" }];
+
+function emptyAreaForm(dongList) {
   return { date: today(), dong: dongList?.[0] || "", masonry: "", caulking: "", truss: "", scaffold: "", actual: "", disaster: "N (정상)", reason: "", note: "", memo: "" };
 }
 function emptyInternalForm(dongList) {
   return { date: today(), dong: dongList?.[0] || "", masonry: "", caulking: "", truss: "", actual: "", disaster: "N (정상)", reason: "", note: "", memo: "" };
 }
 
+// 현장별 면적형 범위 데이터(맵)를 로드. kind: "b"(기준정보) | "l"(실적) | "p"(대기)
+function loadAreaMap(kind, siteId, isDefault) {
+  const m = {};
+  for (const s of AREA_SCOPES) {
+    const base = AREA_STORAGE[s.key][kind];
+    let fallback = [];
+    if (s.key === "external" && isDefault) {
+      if (kind === "b") fallback = BUILDINGS_EXTERNAL;
+      else if (kind === "l") fallback = SEED_LOGS_EXTERNAL;
+    }
+    m[s.key] = Storage.get(Storage.siteKey(base, siteId), fallback);
+  }
+  return m;
+}
+
 export default function App() {
   const [tab, setTab] = useState("input");
-  const [inputMode, setInputMode] = useState("external");
-  const [dashMode, setDashMode] = useState("external");
+  const [inputScope, setInputScope] = useState("external");
+  const [dashScope, setDashScope] = useState("external");
+  const [recoveryScope, setRecoveryScope] = useState("external");
 
   // 현장(site)이 여러 개일 수 있음 — 각 현장은 자기만의 OneDrive 파일(경로)과 데이터를 가짐
   const [sites, setSites] = useState(() => Storage.getSites());
   const [activeSiteId, setActiveSiteId] = useState(() => Storage.getActiveSiteId());
   const activeSite = useMemo(() => sites.find((s) => s.id === activeSiteId) || sites[0] || null, [sites, activeSiteId]);
-  // 저장 effect들이 "지금 어떤 현장 데이터를 쓰고 있는지"를 항상 최신으로 참조하기 위한 ref.
-  // (state인 activeSiteId를 저장 effect의 deps에 넣으면, 현장 전환 시 아직 로드되지 않은
-  //  이전 현장의 데이터가 새 현장 키에 잘못 저장되는 경합이 생길 수 있어 ref로 분리함)
   const currentSiteIdRef = useRef(activeSiteId);
 
-  const [buildingsExternal, setBuildingsExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.buildingsExternal, activeSiteId), BUILDINGS_EXTERNAL));
-  const [buildingsInternal, setBuildingsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), BUILDINGS_INTERNAL));
-  const [logsExternal, setLogsExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.logsExternal, activeSiteId), SEED_LOGS_EXTERNAL));
-  const [logsInternal, setLogsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), SEED_LOGS_INTERNAL));
-  const [pendingExternal, setPendingExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.pendingExternal, activeSiteId), []));
+  const initialIsDefault = !!Storage.getSites().find((s) => s.id === activeSiteId)?.isDefault;
+
+  // 면적형 범위 데이터는 맵으로 관리: { external:[...], hoist:[...], facility:[...] }
+  const [areaB, setAreaB] = useState(() => loadAreaMap("b", activeSiteId, initialIsDefault));
+  const [areaL, setAreaL] = useState(() => loadAreaMap("l", activeSiteId, initialIsDefault));
+  const [areaP, setAreaP] = useState(() => loadAreaMap("p", activeSiteId, initialIsDefault));
+
+  // 내부(세대)는 컬럼 구조가 달라 별도 상태로 유지
+  const [buildingsInternal, setBuildingsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), initialIsDefault ? BUILDINGS_INTERNAL : []));
+  const [logsInternal, setLogsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), initialIsDefault ? SEED_LOGS_INTERNAL : []));
   const [pendingInternal, setPendingInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
   const [checklist, setChecklist] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
 
-  // 동 목록은 고정 상수가 아니라 기준정보(엑셀 ①기준정보, 동기화로 갱신됨)에서 파생.
-  // 현장이 바뀌어 엑셀의 기준정보(동 목록/계획수량 등)가 바뀌면 동기화 시 여기도 자동으로 갱신됨.
-  const dongListExternal = useMemo(() => buildingsExternal.map((b) => b.dong), [buildingsExternal]);
+  // 동 목록은 기준정보(엑셀 ①기준정보)에서 파생 — 동기화 시 자동 갱신
+  const dongListsArea = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, (areaB[s.key] || []).map((b) => b.dong)])), [areaB]);
   const dongListInternal = useMemo(() => [...buildingsInternal.map((b) => b.dong), EXTRA_INTERNAL_DONG], [buildingsInternal]);
 
-  const [formExternal, setFormExternal] = useState(() => emptyExternalForm(dongListExternal));
-  const [formInternal, setFormInternal] = useState(() => emptyInternalForm(dongListInternal));
-  const [recoveryDong, setRecoveryDong] = useState(() => dongListExternal[0] || "");
+  const [areaForms, setAreaForms] = useState(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, emptyAreaForm([])])));
+  const [formInternal, setFormInternal] = useState(() => emptyInternalForm([]));
+  const [recoveryDong, setRecoveryDong] = useState("");
 
   const [account, setAccount] = useState(null);
   const [justLoggedIn, setJustLoggedIn] = useState(false);
@@ -61,18 +96,17 @@ export default function App() {
   const wbRef = useRef(null);
   const itemIdRef = useRef(null);
 
-  // 현장을 전환하면 해당 현장의 데이터를 다시 불러옴. (마이그레이션으로 생성된 "기본 현장"만
-  // 기존 시드 데이터를 기본값으로 쓰고, 새로 추가한 현장은 빈 상태에서 시작해 동기화로 채워짐)
+  // 현장 전환 시 해당 현장 데이터 재로드
   useEffect(() => {
     if (!activeSiteId) return;
     currentSiteIdRef.current = activeSiteId;
     const site = Storage.getSites().find((s) => s.id === activeSiteId);
-    const isDefaultSite = !!site?.isDefault;
-    setBuildingsExternal(Storage.get(Storage.siteKey(Storage.KEYS.buildingsExternal, activeSiteId), isDefaultSite ? BUILDINGS_EXTERNAL : []));
-    setBuildingsInternal(Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), isDefaultSite ? BUILDINGS_INTERNAL : []));
-    setLogsExternal(Storage.get(Storage.siteKey(Storage.KEYS.logsExternal, activeSiteId), isDefaultSite ? SEED_LOGS_EXTERNAL : []));
-    setLogsInternal(Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), isDefaultSite ? SEED_LOGS_INTERNAL : []));
-    setPendingExternal(Storage.get(Storage.siteKey(Storage.KEYS.pendingExternal, activeSiteId), []));
+    const isDef = !!site?.isDefault;
+    setAreaB(loadAreaMap("b", activeSiteId, isDef));
+    setAreaL(loadAreaMap("l", activeSiteId, isDef));
+    setAreaP(loadAreaMap("p", activeSiteId, isDef));
+    setBuildingsInternal(Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), isDef ? BUILDINGS_INTERNAL : []));
+    setLogsInternal(Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), isDef ? SEED_LOGS_INTERNAL : []));
     setPendingInternal(Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
     setChecklist(Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
     setSync({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.siteKey(Storage.KEYS.fileMeta, activeSiteId), {})?.lastSyncedAt || null });
@@ -80,23 +114,32 @@ export default function App() {
     itemIdRef.current = null;
   }, [activeSiteId]);
 
-  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.buildingsExternal, currentSiteIdRef.current), buildingsExternal); }, [buildingsExternal]);
+  // 영속화
+  useEffect(() => { for (const s of AREA_SCOPES) Storage.set(Storage.siteKey(AREA_STORAGE[s.key].b, currentSiteIdRef.current), areaB[s.key]); }, [areaB]);
+  useEffect(() => { for (const s of AREA_SCOPES) Storage.set(Storage.siteKey(AREA_STORAGE[s.key].l, currentSiteIdRef.current), areaL[s.key]); }, [areaL]);
+  useEffect(() => { for (const s of AREA_SCOPES) Storage.set(Storage.siteKey(AREA_STORAGE[s.key].p, currentSiteIdRef.current), areaP[s.key]); }, [areaP]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.buildingsInternal, currentSiteIdRef.current), buildingsInternal); }, [buildingsInternal]);
-  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.logsExternal, currentSiteIdRef.current), logsExternal); }, [logsExternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.logsInternal, currentSiteIdRef.current), logsInternal); }, [logsInternal]);
-  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.pendingExternal, currentSiteIdRef.current), pendingExternal); }, [pendingExternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.pendingInternal, currentSiteIdRef.current), pendingInternal); }, [pendingInternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklist, currentSiteIdRef.current), checklist); }, [checklist]);
 
-  // 기준정보 동기화로 동 목록이 바뀌어 현재 선택값이 더 이상 유효하지 않으면 새 목록의 첫 항목으로 보정
+  // 동 목록 변경 시 폼/만회 대상의 선택값 보정
   useEffect(() => {
-    if (dongListExternal.length && !dongListExternal.includes(formExternal.dong)) {
-      setFormExternal((f) => ({ ...f, dong: dongListExternal[0] }));
-    }
-    if (dongListExternal.length && !dongListExternal.includes(recoveryDong)) {
-      setRecoveryDong(dongListExternal[0]);
-    }
-  }, [dongListExternal]);
+    setAreaForms((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const s of AREA_SCOPES) {
+        const dl = dongListsArea[s.key] || [];
+        if (dl.length && !dl.includes(prev[s.key].dong)) { next[s.key] = { ...prev[s.key], dong: dl[0] }; changed = true; }
+      }
+      return changed ? next : prev;
+    });
+  }, [dongListsArea]);
+
+  useEffect(() => {
+    const dl = dongListsArea[recoveryScope] || [];
+    if (dl.length && !dl.includes(recoveryDong)) setRecoveryDong(dl[0]);
+  }, [recoveryScope, dongListsArea]);
 
   useEffect(() => {
     if (dongListInternal.length && !dongListInternal.includes(formInternal.dong)) {
@@ -109,14 +152,10 @@ export default function App() {
     Graph.initMsal().then((result) => {
       const acc = Graph.getActiveAccount();
       if (acc) setAccount(acc);
-      // 리다이렉트 로그인에서 막 돌아온 경우(result.account 존재) 자동으로 동기화 1회 실행
       if (result?.account) setJustLoggedIn(true);
     }).catch(() => {});
   }, []);
 
-  // account가 막 설정된 직후(리다이렉트 로그인 복귀) 동기화를 한 번 트리거.
-  // useEffect로 분리한 이유: mount 시점 effect의 클로저는 account를 항상 null로 캡처하므로
-  // setAccount 직후 곧바로 runSync()를 호출하면 stale closure 때문에 동작하지 않음.
   useEffect(() => {
     if (justLoggedIn && account) {
       setJustLoggedIn(false);
@@ -124,17 +163,15 @@ export default function App() {
     }
   }, [justLoggedIn, account]);
 
-  const dashExternal = useMemo(() => calcExternalDashboard(buildingsExternal, logsExternal), [buildingsExternal, logsExternal]);
+  const areaDash = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, calcExternalDashboard(areaB[s.key] || [], areaL[s.key] || [])])), [areaB, areaL]);
   const dashInternal = useMemo(() => calcInternalDashboard(buildingsInternal, logsInternal), [buildingsInternal, logsInternal]);
-  const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, buildingsExternal, logsExternal, new Date()), [recoveryDong, buildingsExternal, logsExternal]);
+  const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaL[recoveryScope] || [], new Date()), [recoveryDong, recoveryScope, areaB, areaL]);
 
-  const pendingCount = pendingExternal.length + pendingInternal.length;
+  const pendingCount = AREA_KEYS.reduce((s, k) => s + (areaP[k]?.length || 0), 0) + pendingInternal.length;
 
   async function doLogin() {
     try {
       setSync((s) => ({ ...s, state: "syncing", message: "Microsoft 로그인 화면으로 이동 중..." }));
-      // loginRedirect는 페이지를 이동시키므로 이 함수는 보통 끝까지 실행되지 않습니다.
-      // 로그인 후 돌아오면 위쪽의 justLoggedIn 효과가 계정 설정과 동기화를 처리합니다.
       await Graph.login();
     } catch (e) {
       setSync((s) => ({ ...s, state: "error", message: String(e.message || e) }));
@@ -152,14 +189,23 @@ export default function App() {
     setSync((s) => ({ ...s, state: "syncing", message: "OneDrive에서 받아오는 중..." }));
     try {
       const result = await Graph.syncDown(activeSite);
-      let wb = result.wb;
+      const wb = result.wb;
       const itemId = result.itemId;
 
-      // 보류 중인 입력을 워크북에 반영
-      for (const entry of pendingExternal) Graph.appendExternalRow(wb, entry);
+      // 보류 중인 입력을 워크북에 반영 (해당 시트가 있는 범위만 — 새 시트가 아직 파일에 없으면 보류 유지)
+      let anyPending = false;
+      const appendedKeys = new Set();
+      for (const s of AREA_SCOPES) {
+        if (!wb.getWorksheet(s.sheet)) continue;
+        const list = areaP[s.key] || [];
+        for (const entry of list) Graph.appendAreaRow(wb, s.sheet, s.planRange, entry);
+        appendedKeys.add(s.key);
+        if (list.length) anyPending = true;
+      }
       for (const entry of pendingInternal) Graph.appendInternalRow(wb, entry);
+      if (pendingInternal.length) anyPending = true;
 
-      if (pendingExternal.length || pendingInternal.length) {
+      if (anyPending) {
         setSync((s) => ({ ...s, message: "변경사항 업로드 중..." }));
         await Graph.syncUp(wb, itemId);
       }
@@ -167,14 +213,25 @@ export default function App() {
       wbRef.current = wb;
       itemIdRef.current = itemId;
 
-      const mergedExternal = Graph.readExternalLogs(wb).map((l) => calcRowExternal(l, result.buildings.external.length ? result.buildings.external : buildingsExternal));
-      const mergedInternal = Graph.readInternalLogs(wb).map((l) => calcRowInternal(l));
+      // 범위별로 기준정보·실적 다시 읽기
+      const newB = {};
+      const newL = {};
+      for (const s of AREA_SCOPES) {
+        const b = Graph.readAreaBuildings(wb, s.planLabel);
+        const useB = b.length ? b : (areaB[s.key] || []);
+        newB[s.key] = useB;
+        newL[s.key] = Graph.readAreaLogs(wb, s.sheet).map((l) => calcRowExternal(l, useB));
+      }
+      setAreaB(newB);
+      setAreaL(newL);
 
-      setLogsExternal(mergedExternal);
-      setLogsInternal(mergedInternal);
-      if (result.buildings.external.length) setBuildingsExternal(result.buildings.external);
-      if (result.buildings.internal.length) setBuildingsInternal(result.buildings.internal);
-      setPendingExternal([]);
+      const intB = Graph.readBuildings(wb).internal;
+      const intLogs = Graph.readInternalLogs(wb).map((l) => calcRowInternal(l));
+      setLogsInternal(intLogs);
+      if (intB.length) setBuildingsInternal(intB);
+
+      // 업로드된 범위의 대기만 비움 (시트 없던 범위는 대기 유지)
+      setAreaP((prev) => Object.fromEntries(AREA_KEYS.map((k) => [k, appendedKeys.has(k) ? [] : (prev[k] || [])])));
       setPendingInternal([]);
 
       const now = new Date().toISOString();
@@ -192,48 +249,42 @@ export default function App() {
     Storage.setActiveSiteId(id);
     setActiveSiteId(id);
   }
-
   function handleAddSite(name, filePath) {
     const site = Storage.addSite({ name, filePath });
     setSites(Storage.getSites());
     selectSite(site.id);
   }
-
   function handleUpdateSite(id, name, filePath) {
     Storage.updateSite(id, { name, filePath });
     setSites(Storage.getSites());
-    if (id === activeSiteId) {
-      // 경로가 바뀌었으니 캐시된 워크북/itemId를 비워 다음 동기화 때 새 경로로 다시 찾게 함
-      wbRef.current = null;
-      itemIdRef.current = null;
-    }
+    if (id === activeSiteId) { wbRef.current = null; itemIdRef.current = null; }
   }
-
   function handleDeleteSite(id) {
     Storage.removeSite(id);
     setSites(Storage.getSites());
     if (id === activeSiteId) setActiveSiteId(Storage.getActiveSiteId());
   }
 
-  function saveExternal() {
-    if (!formExternal.dong) return;
+  function saveArea(key) {
+    const form = areaForms[key];
+    if (!form || !form.dong) return;
     const entry = {
       id: `local-${Date.now()}`,
-      date: formExternal.date,
-      dong: formExternal.dong,
-      masonry: Number(formExternal.masonry) || 0,
-      caulking: Number(formExternal.caulking) || 0,
-      truss: Number(formExternal.truss) || 0,
-      scaffold: Number(formExternal.scaffold) || 0,
-      actual: formExternal.actual === "" ? 0 : Number(formExternal.actual),
-      disaster: formExternal.disaster,
-      reason: formExternal.reason,
-      note: formExternal.note,
-      memo: formExternal.memo,
+      date: form.date,
+      dong: form.dong,
+      masonry: Number(form.masonry) || 0,
+      caulking: Number(form.caulking) || 0,
+      truss: Number(form.truss) || 0,
+      scaffold: Number(form.scaffold) || 0,
+      actual: form.actual === "" ? 0 : Number(form.actual),
+      disaster: form.disaster,
+      reason: form.reason,
+      note: form.note,
+      memo: form.memo,
     };
-    setLogsExternal((prev) => [...prev, calcRowExternal(entry, buildingsExternal)]);
-    setPendingExternal((prev) => [...prev, entry]);
-    setFormExternal(emptyExternalForm(dongListExternal));
+    setAreaL((prev) => ({ ...prev, [key]: [...(prev[key] || []), calcRowExternal(entry, areaB[key] || [])] }));
+    setAreaP((prev) => ({ ...prev, [key]: [...(prev[key] || []), entry] }));
+    setAreaForms((prev) => ({ ...prev, [key]: emptyAreaForm(dongListsArea[key]) }));
     if (account) setTimeout(runSync, 50);
   }
 
@@ -262,18 +313,14 @@ export default function App() {
     setChecklist((prev) => ({ ...prev, [idx]: !prev[idx] }));
   }
 
+  const setAreaForm = (key, f) => setAreaForms((prev) => ({ ...prev, [key]: f }));
+
   return (
     <div className="app">
       <div className="header">
         <h1>🪨 석공사 공정관리</h1>
-        <select
-          className="sitepicker"
-          value={activeSiteId || ""}
-          onChange={(e) => selectSite(e.target.value)}
-        >
-          {sites.map((s) => (
-            <option key={s.id} value={s.id}>🏗 {s.name}</option>
-          ))}
+        <select className="sitepicker" value={activeSiteId || ""} onChange={(e) => selectSite(e.target.value)}>
+          {sites.map((s) => (<option key={s.id} value={s.id}>🏗 {s.name}</option>))}
         </select>
         <div className="sub">
           {account ? (
@@ -289,25 +336,25 @@ export default function App() {
       <div className="content">
         {tab === "input" && (
           <InputTab
-            mode={inputMode} setMode={setInputMode}
-            formExternal={formExternal} setFormExternal={setFormExternal}
-            formInternal={formInternal} setFormInternal={setFormInternal}
-            saveExternal={saveExternal} saveInternal={saveInternal}
-            logsExternal={logsExternal} logsInternal={logsInternal}
-            dongListExternal={dongListExternal} dongListInternal={dongListInternal}
+            scope={inputScope} setScope={setInputScope}
+            areaForms={areaForms} setAreaForm={setAreaForm} saveArea={saveArea}
+            formInternal={formInternal} setFormInternal={setFormInternal} saveInternal={saveInternal}
+            areaL={areaL} logsInternal={logsInternal}
+            dongListsArea={dongListsArea} dongListInternal={dongListInternal}
           />
         )}
         {tab === "dash" && (
-          <DashTab mode={dashMode} setMode={setDashMode} dashExternal={dashExternal} dashInternal={dashInternal} />
+          <DashTab scope={dashScope} setScope={setDashScope} areaDash={areaDash} dashInternal={dashInternal} />
         )}
         {tab === "recovery" && (
           <RecoveryTab
+            recoveryScope={recoveryScope} setRecoveryScope={setRecoveryScope}
             recoveryDong={recoveryDong} setRecoveryDong={setRecoveryDong} recovery={recovery}
-            checklist={checklist} toggleCheck={toggleCheck} dongListExternal={dongListExternal}
+            checklist={checklist} toggleCheck={toggleCheck} dongList={dongListsArea[recoveryScope] || []}
           />
         )}
         {tab === "base" && (
-          <BaseTab buildingsExternal={buildingsExternal} buildingsInternal={buildingsInternal} />
+          <BaseTab areaB={areaB} buildingsInternal={buildingsInternal} />
         )}
         {tab === "sync" && (
           <SyncTab
@@ -354,159 +401,195 @@ function Field({ label, children }) {
   );
 }
 
-function InputTab({ mode, setMode, formExternal, setFormExternal, formInternal, setFormInternal, saveExternal, saveInternal, logsExternal, logsInternal, dongListExternal, dongListInternal }) {
+// 범위 전환 버튼 줄 (외부/호이스트/부대시설/내부)
+function ScopeToggle({ scope, setScope }) {
   return (
-    <div>
-      <div className="toggle2">
-        <button className={mode === "external" ? "active" : ""} onClick={() => setMode("external")}>외부(아파트)</button>
-        <button className={mode === "internal" ? "active" : ""} onClick={() => setMode("internal")}>내부(세대)</button>
-      </div>
+    <div className="toggle2" style={{ flexWrap: "wrap" }}>
+      {SCOPE_TABS.map((s) => (
+        <button key={s.key} className={scope === s.key ? "active" : ""} onClick={() => setScope(s.key)}>{s.label}</button>
+      ))}
+    </div>
+  );
+}
 
-      {mode === "external" ? (
-        <div className="card">
-          <h2>일일 실적 입력 · 외부</h2>
-          <Field label="날짜">
-            <input type="date" value={formExternal.date} onChange={(e) => setFormExternal({ ...formExternal, date: e.target.value })} />
-          </Field>
-          <Field label="해당 동(구역)">
-            <select value={formExternal.dong} onChange={(e) => setFormExternal({ ...formExternal, dong: e.target.value })}>
-              {dongListExternal.map((d) => <option key={d} value={d}>{d}</option>)}
-            </select>
-          </Field>
-          <div className="row">
-            <Field label="석공(명)"><input type="number" min="0" value={formExternal.masonry} onChange={(e) => setFormExternal({ ...formExternal, masonry: e.target.value })} /></Field>
-            <Field label="코킹(명)"><input type="number" min="0" value={formExternal.caulking} onChange={(e) => setFormExternal({ ...formExternal, caulking: e.target.value })} /></Field>
-          </div>
-          <div className="row">
-            <Field label="트러스(명)"><input type="number" min="0" value={formExternal.truss} onChange={(e) => setFormExternal({ ...formExternal, truss: e.target.value })} /></Field>
-            <Field label="비계(명)"><input type="number" min="0" value={formExternal.scaffold} onChange={(e) => setFormExternal({ ...formExternal, scaffold: e.target.value })} /></Field>
-          </div>
-          <Field label="실제시공량(m²)">
-            <input type="number" step="0.01" min="0" value={formExternal.actual} onChange={(e) => setFormExternal({ ...formExternal, actual: e.target.value })} />
-          </Field>
-          <div className="row">
-            <Field label="천재지변 여부">
-              <select value={formExternal.disaster} onChange={(e) => setFormExternal({ ...formExternal, disaster: e.target.value })}>
-                {DISASTER_OPTIONS.map((d) => <option key={d} value={d}>{d}</option>)}
-              </select>
-            </Field>
-            <Field label="사유코드">
-              <select value={formExternal.reason} onChange={(e) => setFormExternal({ ...formExternal, reason: e.target.value })}>
-                <option value="">-</option>
-                {REASON_CODES.map((d) => <option key={d} value={d}>{d}</option>)}
-              </select>
-            </Field>
-          </div>
-          <Field label="특기사항·사유">
-            <textarea value={formExternal.note} onChange={(e) => setFormExternal({ ...formExternal, note: e.target.value })} />
-          </Field>
-          <Field label="비고">
-            <textarea value={formExternal.memo} onChange={(e) => setFormExternal({ ...formExternal, memo: e.target.value })} />
-          </Field>
-          <button className="btn btn-primary" onClick={saveExternal}>저장</button>
-        </div>
-      ) : (
-        <div className="card">
-          <h2>일일 실적 입력 · 내부(세대)</h2>
-          <Field label="날짜">
-            <input type="date" value={formInternal.date} onChange={(e) => setFormInternal({ ...formInternal, date: e.target.value })} />
-          </Field>
-          <Field label="해당 동(구역)">
-            <select value={formInternal.dong} onChange={(e) => setFormInternal({ ...formInternal, dong: e.target.value })}>
-              {dongListInternal.map((d) => <option key={d} value={d}>{d}</option>)}
-            </select>
-          </Field>
-          <div className="row">
-            <Field label="석공(명)"><input type="number" min="0" value={formInternal.masonry} onChange={(e) => setFormInternal({ ...formInternal, masonry: e.target.value })} /></Field>
-            <Field label="코킹(명)"><input type="number" min="0" value={formInternal.caulking} onChange={(e) => setFormInternal({ ...formInternal, caulking: e.target.value })} /></Field>
-          </div>
-          <Field label="트러스(명)"><input type="number" min="0" value={formInternal.truss} onChange={(e) => setFormInternal({ ...formInternal, truss: e.target.value })} /></Field>
-          <Field label="실제시공량(세대)">
-            <input type="number" step="0.5" min="0" value={formInternal.actual} onChange={(e) => setFormInternal({ ...formInternal, actual: e.target.value })} />
-          </Field>
-          <div className="row">
-            <Field label="천재지변 여부">
-              <select value={formInternal.disaster} onChange={(e) => setFormInternal({ ...formInternal, disaster: e.target.value })}>
-                {DISASTER_OPTIONS.map((d) => <option key={d} value={d}>{d}</option>)}
-              </select>
-            </Field>
-            <Field label="사유코드">
-              <select value={formInternal.reason} onChange={(e) => setFormInternal({ ...formInternal, reason: e.target.value })}>
-                <option value="">-</option>
-                {REASON_CODES.map((d) => <option key={d} value={d}>{d}</option>)}
-              </select>
-            </Field>
-          </div>
-          <Field label="특기사항·사유">
-            <textarea value={formInternal.note} onChange={(e) => setFormInternal({ ...formInternal, note: e.target.value })} />
-          </Field>
-          <Field label="비고">
-            <textarea value={formInternal.memo} onChange={(e) => setFormInternal({ ...formInternal, memo: e.target.value })} />
-          </Field>
-          <button className="btn btn-primary" onClick={saveInternal}>저장</button>
-        </div>
-      )}
-
-      <div className="card">
-        <h2>최근 입력 내역</h2>
-        <div className="entrylist">
-          {(mode === "external" ? logsExternal : logsInternal).slice(-8).reverse().map((l) => (
-            <div key={l.id} className="entryitem">
-              <div>
-                <div>{l.dong} · 실적 {fmtNum(l.actual)}{mode === "external" ? "m²" : "세대"}</div>
-                <div className="meta">{l.date} · 달성률 {fmtPct(l.rate)}</div>
-              </div>
-              {l.disaster && l.disaster !== "N (정상)" && <span className="pill dot-warn">{l.disaster}</span>}
+function RecentList({ logs, unit }) {
+  return (
+    <div className="card">
+      <h2>최근 입력 내역</h2>
+      <div className="entrylist">
+        {logs.slice(-8).reverse().map((l) => (
+          <div key={l.id} className="entryitem">
+            <div>
+              <div>{l.dong} · 실적 {fmtNum(l.actual)}{unit}</div>
+              <div className="meta">{l.date} · 달성률 {fmtPct(l.rate)}</div>
             </div>
-          ))}
-          {(mode === "external" ? logsExternal : logsInternal).length === 0 && <div className="meta">입력된 실적이 없습니다.</div>}
-        </div>
+            {l.disaster && l.disaster !== "N (정상)" && <span className="pill dot-warn">{l.disaster}</span>}
+          </div>
+        ))}
+        {logs.length === 0 && <div className="meta">입력된 실적이 없습니다.</div>}
       </div>
     </div>
   );
 }
 
-function DashTab({ mode, setMode, dashExternal, dashInternal }) {
+function AreaInputCard({ scope, form, setForm, onSave, dongList }) {
+  return (
+    <div className="card">
+      <h2>일일 실적 입력 · {scope.label}</h2>
+      <Field label="날짜">
+        <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} />
+      </Field>
+      <Field label="해당 동(구역)">
+        <select value={form.dong} onChange={(e) => setForm({ ...form, dong: e.target.value })}>
+          {dongList.length === 0 && <option value="">(기준정보 없음 — 동기화 필요)</option>}
+          {dongList.map((d) => <option key={d} value={d}>{d}</option>)}
+        </select>
+      </Field>
+      <div className="row">
+        <Field label="석공(명)"><input type="number" min="0" value={form.masonry} onChange={(e) => setForm({ ...form, masonry: e.target.value })} /></Field>
+        <Field label="코킹(명)"><input type="number" min="0" value={form.caulking} onChange={(e) => setForm({ ...form, caulking: e.target.value })} /></Field>
+      </div>
+      <div className="row">
+        <Field label="트러스(명)"><input type="number" min="0" value={form.truss} onChange={(e) => setForm({ ...form, truss: e.target.value })} /></Field>
+        <Field label="비계(명)"><input type="number" min="0" value={form.scaffold} onChange={(e) => setForm({ ...form, scaffold: e.target.value })} /></Field>
+      </div>
+      <Field label="실제시공량(m²)">
+        <input type="number" step="0.01" min="0" value={form.actual} onChange={(e) => setForm({ ...form, actual: e.target.value })} />
+      </Field>
+      <div className="row">
+        <Field label="천재지변 여부">
+          <select value={form.disaster} onChange={(e) => setForm({ ...form, disaster: e.target.value })}>
+            {DISASTER_OPTIONS.map((d) => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </Field>
+        <Field label="사유코드">
+          <select value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })}>
+            <option value="">-</option>
+            {REASON_CODES.map((d) => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </Field>
+      </div>
+      <Field label="특기사항·사유">
+        <textarea value={form.note} onChange={(e) => setForm({ ...form, note: e.target.value })} />
+      </Field>
+      <Field label="비고">
+        <textarea value={form.memo} onChange={(e) => setForm({ ...form, memo: e.target.value })} />
+      </Field>
+      <button className="btn btn-primary" onClick={onSave}>저장</button>
+    </div>
+  );
+}
+
+function InternalInputCard({ form, setForm, onSave, dongList }) {
+  return (
+    <div className="card">
+      <h2>일일 실적 입력 · 내부(세대)</h2>
+      <Field label="날짜">
+        <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} />
+      </Field>
+      <Field label="해당 동(구역)">
+        <select value={form.dong} onChange={(e) => setForm({ ...form, dong: e.target.value })}>
+          {dongList.map((d) => <option key={d} value={d}>{d}</option>)}
+        </select>
+      </Field>
+      <div className="row">
+        <Field label="석공(명)"><input type="number" min="0" value={form.masonry} onChange={(e) => setForm({ ...form, masonry: e.target.value })} /></Field>
+        <Field label="코킹(명)"><input type="number" min="0" value={form.caulking} onChange={(e) => setForm({ ...form, caulking: e.target.value })} /></Field>
+      </div>
+      <Field label="트러스(명)"><input type="number" min="0" value={form.truss} onChange={(e) => setForm({ ...form, truss: e.target.value })} /></Field>
+      <Field label="실제시공량(세대)">
+        <input type="number" step="0.5" min="0" value={form.actual} onChange={(e) => setForm({ ...form, actual: e.target.value })} />
+      </Field>
+      <div className="row">
+        <Field label="천재지변 여부">
+          <select value={form.disaster} onChange={(e) => setForm({ ...form, disaster: e.target.value })}>
+            {DISASTER_OPTIONS.map((d) => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </Field>
+        <Field label="사유코드">
+          <select value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })}>
+            <option value="">-</option>
+            {REASON_CODES.map((d) => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </Field>
+      </div>
+      <Field label="특기사항·사유">
+        <textarea value={form.note} onChange={(e) => setForm({ ...form, note: e.target.value })} />
+      </Field>
+      <Field label="비고">
+        <textarea value={form.memo} onChange={(e) => setForm({ ...form, memo: e.target.value })} />
+      </Field>
+      <button className="btn btn-primary" onClick={onSave}>저장</button>
+    </div>
+  );
+}
+
+function InputTab({ scope, setScope, areaForms, setAreaForm, saveArea, formInternal, setFormInternal, saveInternal, areaL, logsInternal, dongListsArea, dongListInternal }) {
+  const areaScope = AREA_SCOPES.find((s) => s.key === scope);
   return (
     <div>
-      <div className="toggle2">
-        <button className={mode === "external" ? "active" : ""} onClick={() => setMode("external")}>외부(아파트)</button>
-        <button className={mode === "internal" ? "active" : ""} onClick={() => setMode("internal")}>내부(세대)</button>
-      </div>
+      <ScopeToggle scope={scope} setScope={setScope} />
+      {areaScope ? (
+        <AreaInputCard
+          scope={areaScope}
+          form={areaForms[scope]}
+          setForm={(f) => setAreaForm(scope, f)}
+          onSave={() => saveArea(scope)}
+          dongList={dongListsArea[scope] || []}
+        />
+      ) : (
+        <InternalInputCard form={formInternal} setForm={setFormInternal} onSave={saveInternal} dongList={dongListInternal} />
+      )}
+      <RecentList logs={areaScope ? (areaL[scope] || []) : logsInternal} unit={areaScope ? "m²" : "세대"} />
+    </div>
+  );
+}
 
-      {mode === "external" ? (
-        <>
-          <div className="card">
-            <h2>전체 공사 현황 요약</h2>
-            <div className="statgrid">
-              <div className="stat"><div className="label">전체 계획 수량</div><div className="value">{fmtNum(dashExternal.totalPlanArea)} m²</div></div>
-              <div className="stat"><div className="label">누적 실제시공량</div><div className="value">{fmtNum(dashExternal.cumActual)} m²</div></div>
-              <div className="stat"><div className="label">전체 달성률</div><div className="value">{fmtPct(dashExternal.overallRate)}</div></div>
-              <div className="stat"><div className="label">기간 달성률</div><div className="value">{fmtPct(dashExternal.periodRate)}</div></div>
-              <div className="stat"><div className="label">총 투입인원(연인원)</div><div className="value">{fmtNum(dashExternal.totalWorkers, 0)}명</div></div>
-              <div className="stat"><div className="label">1인당 평균 시공량</div><div className="value">{fmtNum(dashExternal.perWorker)} m²</div></div>
-              <div className="stat"><div className="label">천재지변 발생일수</div><div className="value">{dashExternal.disasterDays}일</div></div>
-              <div className="stat"><div className="label">작업 총 일수</div><div className="value">{dashExternal.totalDays}일</div></div>
-            </div>
-          </div>
-          <div className="card">
-            <h2>동별 달성률 현황</h2>
-            <table className="dashtable">
-              <thead><tr><th>동</th><th>계획(m²)</th><th>실적(m²)</th><th>달성률</th><th>상태</th></tr></thead>
-              <tbody>
-                {dashExternal.byBuilding.map((b) => (
-                  <tr key={b.dong}>
-                    <td className="dong">{b.dong}</td>
-                    <td>{fmtNum(b.planArea)}</td>
-                    <td>{fmtNum(b.cumActual)}</td>
-                    <td>{fmtPct(b.rate)}</td>
-                    <td style={{ color: b.status.color }}>{b.status.label}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </>
+function AreaDashCard({ scope, dash }) {
+  return (
+    <>
+      <div className="card">
+        <h2>{scope.label} · 전체 현황 요약</h2>
+        <div className="statgrid">
+          <div className="stat"><div className="label">전체 계획 수량</div><div className="value">{fmtNum(dash.totalPlanArea)} m²</div></div>
+          <div className="stat"><div className="label">누적 실제시공량</div><div className="value">{fmtNum(dash.cumActual)} m²</div></div>
+          <div className="stat"><div className="label">전체 달성률</div><div className="value">{fmtPct(dash.overallRate)}</div></div>
+          <div className="stat"><div className="label">기간 달성률</div><div className="value">{fmtPct(dash.periodRate)}</div></div>
+          <div className="stat"><div className="label">총 투입인원(연인원)</div><div className="value">{fmtNum(dash.totalWorkers, 0)}명</div></div>
+          <div className="stat"><div className="label">1인당 평균 시공량</div><div className="value">{fmtNum(dash.perWorker)} m²</div></div>
+          <div className="stat"><div className="label">천재지변 발생일수</div><div className="value">{dash.disasterDays}일</div></div>
+          <div className="stat"><div className="label">작업 총 일수</div><div className="value">{dash.totalDays}일</div></div>
+        </div>
+      </div>
+      <div className="card">
+        <h2>동별 달성률 현황</h2>
+        <table className="dashtable">
+          <thead><tr><th>동</th><th>계획(m²)</th><th>실적(m²)</th><th>달성률</th><th>상태</th></tr></thead>
+          <tbody>
+            {dash.byBuilding.map((b) => (
+              <tr key={b.dong}>
+                <td className="dong">{b.dong}</td>
+                <td>{fmtNum(b.planArea)}</td>
+                <td>{fmtNum(b.cumActual)}</td>
+                <td>{fmtPct(b.rate)}</td>
+                <td style={{ color: b.status.color }}>{b.status.label}</td>
+              </tr>
+            ))}
+            {dash.byBuilding.length === 0 && <tr><td colSpan="5" className="meta">기준정보가 없습니다 — 동기화하세요.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function DashTab({ scope, setScope, areaDash, dashInternal }) {
+  const areaScope = AREA_SCOPES.find((s) => s.key === scope);
+  return (
+    <div>
+      <ScopeToggle scope={scope} setScope={setScope} />
+      {areaScope ? (
+        <AreaDashCard scope={areaScope} dash={areaDash[scope]} />
       ) : (
         <>
           <div className="card">
@@ -543,14 +626,20 @@ function DashTab({ mode, setMode, dashExternal, dashInternal }) {
   );
 }
 
-function RecoveryTab({ recoveryDong, setRecoveryDong, recovery, checklist, toggleCheck, dongListExternal }) {
+function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecoveryDong, recovery, checklist, toggleCheck, dongList }) {
   return (
     <div>
       <div className="card">
         <h2>만회계획 자동 산출</h2>
+        <Field label="공사 범위">
+          <select value={recoveryScope} onChange={(e) => setRecoveryScope(e.target.value)}>
+            {AREA_SCOPES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+        </Field>
         <Field label="대상 동 선택">
           <select value={recoveryDong} onChange={(e) => setRecoveryDong(e.target.value)}>
-            {dongListExternal.map((d) => <option key={d} value={d}>{d}</option>)}
+            {dongList.length === 0 && <option value="">(기준정보 없음)</option>}
+            {dongList.map((d) => <option key={d} value={d}>{d}</option>)}
           </select>
         </Field>
         {recovery && (
@@ -568,9 +657,8 @@ function RecoveryTab({ recoveryDong, setRecoveryDong, recovery, checklist, toggl
             <div className="stat"><div className="label">만회 필요 추가인원</div><div className="value">{recovery.extraWorkers}명</div></div>
           </div>
         )}
-        {recovery && (
-          <div className="banner info" style={{ marginTop: 10 }}>{recovery.verdict}</div>
-        )}
+        {recovery && <div className="banner info" style={{ marginTop: 10 }}>{recovery.verdict}</div>}
+        {!recovery && <div className="meta">선택한 범위·동의 기준정보가 없습니다. 동기화 후 다시 시도하세요.</div>}
       </div>
 
       <div className="card">
@@ -597,26 +685,29 @@ function RecoveryTab({ recoveryDong, setRecoveryDong, recovery, checklist, toggl
   );
 }
 
-function BaseTab({ buildingsExternal, buildingsInternal }) {
+function BaseTab({ areaB, buildingsInternal }) {
   return (
     <div>
-      <div className="card">
-        <h2>동별 시공 계획 수량 (외부)</h2>
-        <table className="dashtable">
-          <thead><tr><th>동</th><th>전체수량(m²)</th><th>시작일</th><th>완료예정</th><th>기준인원</th></tr></thead>
-          <tbody>
-            {buildingsExternal.map((b) => (
-              <tr key={b.dong}>
-                <td className="dong">{b.dong}</td>
-                <td>{fmtNum(b.totalArea)}</td>
-                <td>{b.startDate}</td>
-                <td>{b.endDate}</td>
-                <td>{b.baseWorkers}명</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {AREA_SCOPES.map((s) => (
+        <div className="card" key={s.key}>
+          <h2>{s.label} · 시공 계획 수량</h2>
+          <table className="dashtable">
+            <thead><tr><th>동</th><th>전체수량(m²)</th><th>시작일</th><th>완료예정</th><th>기준인원</th></tr></thead>
+            <tbody>
+              {(areaB[s.key] || []).map((b) => (
+                <tr key={b.dong}>
+                  <td className="dong">{b.dong}</td>
+                  <td>{fmtNum(b.totalArea)}</td>
+                  <td>{b.startDate}</td>
+                  <td>{b.endDate}</td>
+                  <td>{b.baseWorkers}명</td>
+                </tr>
+              ))}
+              {(areaB[s.key] || []).length === 0 && <tr><td colSpan="5" className="meta">기준정보 없음 — 동기화하세요.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      ))}
       <div className="card">
         <h2>내부(세대) 기준정보</h2>
         <table className="dashtable">
@@ -686,9 +777,9 @@ function SyncTab({
       <div className="card">
         <h3>알아두실 점</h3>
         <p style={{ fontSize: 12.5, color: "#6b7280", lineHeight: 1.6 }}>
-          개인 OneDrive 계정은 엑셀 셀 단위 API를 지원하지 않아, 동기화 시 파일 전체를 받아 수정 후 다시 업로드합니다.
-          동기화 중에는 PC에서 OneDrive 동기화 중인 같은 파일을 열어두지 않는 것을 권장합니다(동시 저장 시 충돌 가능).
-          서식·색상 등 일부 디자인은 동기화 과정에서 미세하게 달라질 수 있습니다. 현장을 추가할 때도 같은 형식(①기준정보·②일일실적입력 시트 구조)의 엑셀 파일이어야 합니다.
+          개인 OneDrive 계정은 엑셀 셀 단위 API를 지원하지 않아, 동기화 시 파일 전체를 받아 수정 후 다시 업로드합니다(서식·색상·메모는 보존됩니다).
+          동기화 중에는 PC에서 같은 파일을 열어두지 않는 것을 권장합니다(동시 저장 시 충돌 가능).
+          공사 범위(외부·호이스트·부대시설 등)는 엑셀 ①기준정보의 "▶ ○○ 수량" 블록과 "②일일실적입력(○○)" 시트로 관리되며, 같은 형식이면 앱이 자동으로 읽어 화면에 표시합니다.
         </p>
       </div>
     </div>
@@ -696,25 +787,13 @@ function SyncTab({
 }
 
 function SiteManager({ sites, activeSiteId, onSelect, onAdd, onUpdate, onDelete }) {
-  const [editingId, setEditingId] = useState(null); // "new" | site.id | null
+  const [editingId, setEditingId] = useState(null);
   const [name, setName] = useState("");
   const [filePath, setFilePath] = useState("");
 
-  function startAdd() {
-    setEditingId("new");
-    setName("");
-    setFilePath("");
-  }
-  function startEdit(site) {
-    setEditingId(site.id);
-    setName(site.name);
-    setFilePath(site.filePath);
-  }
-  function cancelForm() {
-    setEditingId(null);
-    setName("");
-    setFilePath("");
-  }
+  function startAdd() { setEditingId("new"); setName(""); setFilePath(""); }
+  function startEdit(site) { setEditingId(site.id); setName(site.name); setFilePath(site.filePath); }
+  function cancelForm() { setEditingId(null); setName(""); setFilePath(""); }
   function submitForm() {
     const trimmedName = name.trim();
     const trimmedPath = filePath.trim();
