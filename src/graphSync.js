@@ -382,6 +382,38 @@ export function readAreaLogs(wb, sheetName) {
   return out;
 }
 
+// 면적형 시트의 투입인원 슬롯(D~G 4칸)과 그 헤더(4행) 라벨.
+// 사용자가 엑셀 헤더 텍스트만 바꾸면 앱 입력폼의 칸 이름/개수가 자동으로 따라갑니다.
+const AREA_FIELD_SLOTS = [
+  { key: "masonry", col: "D" },
+  { key: "caulking", col: "E" },
+  { key: "truss", col: "F" },
+  { key: "scaffold", col: "G" },
+];
+
+function cleanFieldLabel(s) {
+  return String(s ?? "")
+    .replace(/_x000D_/g, "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/투입\s*인원/g, "")
+    .replace(/\(\s*명\s*\)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// 헤더(기본 4행)에서 투입인원 컬럼(D~G) 라벨을 읽어 동적 입력필드 구성을 만든다.
+// 라벨이 빈 슬롯은 제외 → 범위별로 공정(인원) 항목 수·이름이 다를 수 있음.
+export function readAreaFields(wb, sheetName, headerRow = 4) {
+  const ws = wb.getWorksheet(sheetName);
+  const out = [];
+  if (!ws) return out;
+  for (const slot of AREA_FIELD_SLOTS) {
+    const label = cleanFieldLabel(rawCell(ws, `${slot.col}${headerRow}`));
+    if (label) out.push({ key: slot.key, col: slot.col, label });
+  }
+  return out;
+}
+
 // 면적형 기준정보 블록을 "▶ ○○ 수량" 라벨로 찾아 읽음 (외부/호이스트/부대시설 공용).
 export function readAreaBuildings(wb, headerIncludes) {
   const ws = wb.getWorksheet(SHEET_BASE);

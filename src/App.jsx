@@ -14,7 +14,6 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-// 내부(세대) 동 목록에는 기준정보(엑셀)에 세대수가 없는 특수 구역도 선택할 수 있게 항상 추가해줌
 const EXTRA_INTERNAL_DONG = "게스트하우스";
 
 // ===== 공사 범위(scope) 정의 =====
@@ -32,8 +31,19 @@ const AREA_STORAGE = {
   hoist: { b: Storage.KEYS.buildingsHoist, l: Storage.KEYS.logsHoist, p: Storage.KEYS.pendingHoist },
   facility: { b: Storage.KEYS.buildingsFacility, l: Storage.KEYS.logsFacility, p: Storage.KEYS.pendingFacility },
 };
-// 입력/현황 화면의 범위 전환 탭 (면적형 범위들 + 내부(세대))
 const SCOPE_TABS = [...AREA_SCOPES.map((s) => ({ key: s.key, label: s.label })), { key: "internal", label: "내부(세대)" }];
+
+// 투입인원 입력 칸 기본 구성 (동기화 전, 또는 헤더를 못 읽을 때 사용).
+// 동기화하면 각 범위 시트의 헤더(4행)에서 실제 라벨/개수를 읽어 자동으로 대체됩니다.
+const DEFAULT_AREA_FIELDS = [
+  { key: "masonry", label: "석공" },
+  { key: "caulking", label: "코킹" },
+  { key: "truss", label: "트러스" },
+  { key: "scaffold", label: "비계" },
+];
+function defaultAreaFieldsMap() {
+  return Object.fromEntries(AREA_SCOPES.map((s) => [s.key, DEFAULT_AREA_FIELDS]));
+}
 
 function emptyAreaForm(dongList) {
   return { date: today(), dong: dongList?.[0] || "", masonry: "", caulking: "", truss: "", scaffold: "", actual: "", disaster: "N (정상)", reason: "", note: "", memo: "" };
@@ -63,7 +73,6 @@ export default function App() {
   const [dashScope, setDashScope] = useState("external");
   const [recoveryScope, setRecoveryScope] = useState("external");
 
-  // 현장(site)이 여러 개일 수 있음 — 각 현장은 자기만의 OneDrive 파일(경로)과 데이터를 가짐
   const [sites, setSites] = useState(() => Storage.getSites());
   const [activeSiteId, setActiveSiteId] = useState(() => Storage.getActiveSiteId());
   const activeSite = useMemo(() => sites.find((s) => s.id === activeSiteId) || sites[0] || null, [sites, activeSiteId]);
@@ -71,21 +80,20 @@ export default function App() {
 
   const initialIsDefault = !!Storage.getSites().find((s) => s.id === activeSiteId)?.isDefault;
 
-  // 면적형 범위 데이터는 맵으로 관리: { external:[...], hoist:[...], facility:[...] }
   const [areaB, setAreaB] = useState(() => loadAreaMap("b", activeSiteId, initialIsDefault));
   const [areaL, setAreaL] = useState(() => loadAreaMap("l", activeSiteId, initialIsDefault));
   const [areaP, setAreaP] = useState(() => loadAreaMap("p", activeSiteId, initialIsDefault));
 
-  // 내부(세대)는 컬럼 구조가 달라 별도 상태로 유지
   const [buildingsInternal, setBuildingsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), initialIsDefault ? BUILDINGS_INTERNAL : []));
   const [logsInternal, setLogsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), initialIsDefault ? SEED_LOGS_INTERNAL : []));
   const [pendingInternal, setPendingInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
   const [checklist, setChecklist] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
 
-  // 동 목록은 기준정보(엑셀 ①기준정보)에서 파생 — 동기화 시 자동 갱신
   const dongListsArea = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, (areaB[s.key] || []).map((b) => b.dong)])), [areaB]);
   const dongListInternal = useMemo(() => [...buildingsInternal.map((b) => b.dong), EXTRA_INTERNAL_DONG], [buildingsInternal]);
 
+  // 범위별 투입인원 입력 칸 구성 (동기화 시 엑셀 헤더에서 읽어 채움)
+  const [areaFields, setAreaFields] = useState(() => defaultAreaFieldsMap());
   const [areaForms, setAreaForms] = useState(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, emptyAreaForm([])])));
   const [formInternal, setFormInternal] = useState(() => emptyInternalForm([]));
   const [recoveryDong, setRecoveryDong] = useState("");
@@ -105,6 +113,7 @@ export default function App() {
     setAreaB(loadAreaMap("b", activeSiteId, isDef));
     setAreaL(loadAreaMap("l", activeSiteId, isDef));
     setAreaP(loadAreaMap("p", activeSiteId, isDef));
+    setAreaFields(defaultAreaFieldsMap());
     setBuildingsInternal(Storage.get(Storage.siteKey(Storage.KEYS.buildingsInternal, activeSiteId), isDef ? BUILDINGS_INTERNAL : []));
     setLogsInternal(Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), isDef ? SEED_LOGS_INTERNAL : []));
     setPendingInternal(Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
@@ -114,7 +123,6 @@ export default function App() {
     itemIdRef.current = null;
   }, [activeSiteId]);
 
-  // 영속화
   useEffect(() => { for (const s of AREA_SCOPES) Storage.set(Storage.siteKey(AREA_STORAGE[s.key].b, currentSiteIdRef.current), areaB[s.key]); }, [areaB]);
   useEffect(() => { for (const s of AREA_SCOPES) Storage.set(Storage.siteKey(AREA_STORAGE[s.key].l, currentSiteIdRef.current), areaL[s.key]); }, [areaL]);
   useEffect(() => { for (const s of AREA_SCOPES) Storage.set(Storage.siteKey(AREA_STORAGE[s.key].p, currentSiteIdRef.current), areaP[s.key]); }, [areaP]);
@@ -123,7 +131,6 @@ export default function App() {
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.pendingInternal, currentSiteIdRef.current), pendingInternal); }, [pendingInternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklist, currentSiteIdRef.current), checklist); }, [checklist]);
 
-  // 동 목록 변경 시 폼/만회 대상의 선택값 보정
   useEffect(() => {
     setAreaForms((prev) => {
       let changed = false;
@@ -192,7 +199,6 @@ export default function App() {
       const wb = result.wb;
       const itemId = result.itemId;
 
-      // 보류 중인 입력을 워크북에 반영 (해당 시트가 있는 범위만 — 새 시트가 아직 파일에 없으면 보류 유지)
       let anyPending = false;
       const appendedKeys = new Set();
       for (const s of AREA_SCOPES) {
@@ -213,24 +219,26 @@ export default function App() {
       wbRef.current = wb;
       itemIdRef.current = itemId;
 
-      // 범위별로 기준정보·실적 다시 읽기
       const newB = {};
       const newL = {};
+      const newFields = {};
       for (const s of AREA_SCOPES) {
         const b = Graph.readAreaBuildings(wb, s.planLabel);
         const useB = b.length ? b : (areaB[s.key] || []);
         newB[s.key] = useB;
         newL[s.key] = Graph.readAreaLogs(wb, s.sheet).map((l) => calcRowExternal(l, useB));
+        const f = Graph.readAreaFields(wb, s.sheet);
+        newFields[s.key] = f.length ? f : DEFAULT_AREA_FIELDS;
       }
       setAreaB(newB);
       setAreaL(newL);
+      setAreaFields(newFields);
 
       const intB = Graph.readBuildings(wb).internal;
       const intLogs = Graph.readInternalLogs(wb).map((l) => calcRowInternal(l));
       setLogsInternal(intLogs);
       if (intB.length) setBuildingsInternal(intB);
 
-      // 업로드된 범위의 대기만 비움 (시트 없던 범위는 대기 유지)
       setAreaP((prev) => Object.fromEntries(AREA_KEYS.map((k) => [k, appendedKeys.has(k) ? [] : (prev[k] || [])])));
       setPendingInternal([]);
 
@@ -244,7 +252,6 @@ export default function App() {
     }
   }
 
-  // ---- 현장 관리 ----
   function selectSite(id) {
     Storage.setActiveSiteId(id);
     setActiveSiteId(id);
@@ -337,7 +344,7 @@ export default function App() {
         {tab === "input" && (
           <InputTab
             scope={inputScope} setScope={setInputScope}
-            areaForms={areaForms} setAreaForm={setAreaForm} saveArea={saveArea}
+            areaForms={areaForms} setAreaForm={setAreaForm} saveArea={saveArea} areaFields={areaFields}
             formInternal={formInternal} setFormInternal={setFormInternal} saveInternal={saveInternal}
             areaL={areaL} logsInternal={logsInternal}
             dongListsArea={dongListsArea} dongListInternal={dongListInternal}
@@ -401,7 +408,6 @@ function Field({ label, children }) {
   );
 }
 
-// 범위 전환 버튼 줄 (외부/호이스트/부대시설/내부)
 function ScopeToggle({ scope, setScope }) {
   return (
     <div className="toggle2" style={{ flexWrap: "wrap" }}>
@@ -432,7 +438,18 @@ function RecentList({ logs, unit }) {
   );
 }
 
-function AreaInputCard({ scope, form, setForm, onSave, dongList }) {
+// 투입인원 필드를 2개씩 한 줄로 묶음
+function pairRows(fields) {
+  const rows = [];
+  fields.forEach((f, i) => {
+    if (i % 2 === 0) rows.push([f]);
+    else rows[rows.length - 1].push(f);
+  });
+  return rows;
+}
+
+function AreaInputCard({ scope, form, setForm, onSave, dongList, fields }) {
+  const workerFields = fields && fields.length ? fields : DEFAULT_AREA_FIELDS;
   return (
     <div className="card">
       <h2>일일 실적 입력 · {scope.label}</h2>
@@ -445,14 +462,15 @@ function AreaInputCard({ scope, form, setForm, onSave, dongList }) {
           {dongList.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
       </Field>
-      <div className="row">
-        <Field label="석공(명)"><input type="number" min="0" value={form.masonry} onChange={(e) => setForm({ ...form, masonry: e.target.value })} /></Field>
-        <Field label="코킹(명)"><input type="number" min="0" value={form.caulking} onChange={(e) => setForm({ ...form, caulking: e.target.value })} /></Field>
-      </div>
-      <div className="row">
-        <Field label="트러스(명)"><input type="number" min="0" value={form.truss} onChange={(e) => setForm({ ...form, truss: e.target.value })} /></Field>
-        <Field label="비계(명)"><input type="number" min="0" value={form.scaffold} onChange={(e) => setForm({ ...form, scaffold: e.target.value })} /></Field>
-      </div>
+      {pairRows(workerFields).map((pair, ri) => (
+        <div className="row" key={ri}>
+          {pair.map((f) => (
+            <Field key={f.key} label={f.label + "(명)"}>
+              <input type="number" min="0" value={form[f.key] ?? ""} onChange={(e) => setForm({ ...form, [f.key]: e.target.value })} />
+            </Field>
+          ))}
+        </div>
+      ))}
       <Field label="실제시공량(m²)">
         <input type="number" step="0.01" min="0" value={form.actual} onChange={(e) => setForm({ ...form, actual: e.target.value })} />
       </Field>
@@ -524,7 +542,7 @@ function InternalInputCard({ form, setForm, onSave, dongList }) {
   );
 }
 
-function InputTab({ scope, setScope, areaForms, setAreaForm, saveArea, formInternal, setFormInternal, saveInternal, areaL, logsInternal, dongListsArea, dongListInternal }) {
+function InputTab({ scope, setScope, areaForms, setAreaForm, saveArea, areaFields, formInternal, setFormInternal, saveInternal, areaL, logsInternal, dongListsArea, dongListInternal }) {
   const areaScope = AREA_SCOPES.find((s) => s.key === scope);
   return (
     <div>
@@ -536,6 +554,7 @@ function InputTab({ scope, setScope, areaForms, setAreaForm, saveArea, formInter
           setForm={(f) => setAreaForm(scope, f)}
           onSave={() => saveArea(scope)}
           dongList={dongListsArea[scope] || []}
+          fields={areaFields[scope] || DEFAULT_AREA_FIELDS}
         />
       ) : (
         <InternalInputCard form={formInternal} setForm={setFormInternal} onSave={saveInternal} dongList={dongListInternal} />
@@ -779,7 +798,7 @@ function SyncTab({
         <p style={{ fontSize: 12.5, color: "#6b7280", lineHeight: 1.6 }}>
           개인 OneDrive 계정은 엑셀 셀 단위 API를 지원하지 않아, 동기화 시 파일 전체를 받아 수정 후 다시 업로드합니다(서식·색상·메모는 보존됩니다).
           동기화 중에는 PC에서 같은 파일을 열어두지 않는 것을 권장합니다(동시 저장 시 충돌 가능).
-          공사 범위(외부·호이스트·부대시설 등)는 엑셀 ①기준정보의 "▶ ○○ 수량" 블록과 "②일일실적입력(○○)" 시트로 관리되며, 같은 형식이면 앱이 자동으로 읽어 화면에 표시합니다.
+          공사 범위(외부·호이스트·부대시설 등)는 엑셀 ①기준정보의 "▶ ○○ 수량" 블록과 "②일일실적입력(○○)" 시트로 관리되며, 같은 형식이면 앱이 자동으로 읽어 화면에 표시합니다. 투입인원 칸 이름도 각 시트의 헤더(4행)를 그대로 따라갑니다.
         </p>
       </div>
     </div>
