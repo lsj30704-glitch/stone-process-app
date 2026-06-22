@@ -303,33 +303,54 @@ export function readInternalLogs(wb) {
   return out;
 }
 
+// ①기준정보 시트는 사용자가 중간에 공사 범위 블록(호이스트·부대시설 등)을 추가/이동할 수 있어,
+// 고정 행 위치로 읽으면 행이 밀릴 때 엉뚱한 데이터를 읽게 됩니다. 그래서 "▶ ○○ 수량/기준정보"
+// 헤더 라벨로 블록을 찾아 그 안의 데이터 행만 읽습니다. (행이 밀려도 안전)
+function findBlockDataRows(ws, headerIncludes, maxRow = 300) {
+  let headerRow = null;
+  for (let r = 1; r <= maxRow; r++) {
+    const b = rawCell(ws, `B${r}`);
+    if (typeof b === "string" && b.includes(headerIncludes)) {
+      headerRow = r;
+      break;
+    }
+  }
+  if (!headerRow) return [];
+  const rows = [];
+  // 헤더 다음 행은 컬럼 제목 행 → 그 다음부터가 데이터. 다음 블록(▶) 또는 "합 계" 행에서 종료.
+  for (let r = headerRow + 2; r <= maxRow; r++) {
+    const b = rawCell(ws, `B${r}`);
+    const bs = b == null ? "" : String(b).trim();
+    if (bs.startsWith("▶")) break;
+    if (bs.replace(/\s/g, "").startsWith("합계")) break;
+    if (bs === "") continue; // 동(구역)명이 빈 보조행은 건너뜀
+    rows.push(r);
+  }
+  return rows;
+}
+
 export function readBuildings(wb) {
   const ws = wb.getWorksheet(SHEET_BASE);
   if (!ws) return { external: [], internal: [] };
-  const external = [];
-  for (let r = 6; r <= 13; r++) {
-    const dong = rawCell(ws, `B${r}`);
-    if (!dong) continue;
-    external.push({
-      dong,
-      totalArea: rawCell(ws, `C${r}`) ?? 0,
-      startDate: excelDateToISO(rawCell(ws, `D${r}`)),
-      endDate: excelDateToISO(rawCell(ws, `E${r}`)),
-      workDays: rawCell(ws, `F${r}`) ?? 0,
-      dailyPlan: rawCell(ws, `G${r}`) ?? 0,
-      baseWorkers: rawCell(ws, `H${r}`) ?? 0,
-      hoist: rawCell(ws, `I${r}`) ?? 0,
-      note: rawCell(ws, `J${r}`) ?? "",
-    });
-  }
-  const internal = [];
-  for (let r = 45; r <= 52; r++) {
-    const dong = rawCell(ws, `B${r}`);
-    if (!dong) continue;
+
+  const external = findBlockDataRows(ws, "동별 시공 계획 수량").map((r) => ({
+    dong: rawCell(ws, `B${r}`),
+    totalArea: rawCell(ws, `C${r}`) ?? 0,
+    startDate: excelDateToISO(rawCell(ws, `D${r}`)),
+    endDate: excelDateToISO(rawCell(ws, `E${r}`)),
+    workDays: rawCell(ws, `F${r}`) ?? 0,
+    dailyPlan: rawCell(ws, `G${r}`) ?? 0,
+    baseWorkers: rawCell(ws, `H${r}`) ?? 0,
+    hoist: rawCell(ws, `I${r}`) ?? 0,
+    note: rawCell(ws, `J${r}`) ?? "",
+  }));
+
+  const internal = findBlockDataRows(ws, "내부(세대) 기준정보").map((r) => {
     const totalUnits = rawCell(ws, `C${r}`) ?? 0;
     const optionUnits = rawCell(ws, `D${r}`) ?? 0;
-    internal.push({ dong, totalUnits, optionUnits, normalUnits: totalUnits - optionUnits });
-  }
+    return { dong: rawCell(ws, `B${r}`), totalUnits, optionUnits, normalUnits: totalUnits - optionUnits };
+  });
+
   return { external, internal };
 }
 
