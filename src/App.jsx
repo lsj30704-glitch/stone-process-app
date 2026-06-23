@@ -157,9 +157,11 @@ export default function App() {
   useEffect(() => {
     if (!Graph.isConfigured()) return;
     Graph.initMsal().then((result) => {
-      const acc = Graph.getActiveAccount();
-      if (acc) setAccount(acc);
-      if (result?.account) setJustLoggedIn(true);
+      const acc = result?.account || Graph.getActiveAccount();
+      if (acc) {
+        setAccount(acc);
+        setJustLoggedIn(true); // 로그인돼 있으면 앱 열 때 자동 동기화 → 묵은 화면(이전 저장값) 방지
+      }
     }).catch(() => {});
   }, []);
 
@@ -224,9 +226,9 @@ export default function App() {
       const newFields = {};
       for (const s of AREA_SCOPES) {
         const b = Graph.readAreaBuildings(wb, s.planLabel);
-        const useB = b.length ? b : (areaB[s.key] || []);
-        newB[s.key] = useB;
-        newL[s.key] = Graph.readAreaLogs(wb, s.sheet).map((l) => calcRowExternal(l, useB));
+        // 파일이 진실원천 — 읽은 결과를 그대로 반영(빈 값이면 비움). 묵은 데이터가 남지 않게 함.
+        newB[s.key] = b;
+        newL[s.key] = Graph.readAreaLogs(wb, s.sheet).map((l) => calcRowExternal(l, b));
         const f = Graph.readAreaFields(wb, s.sheet);
         newFields[s.key] = f.length ? f : DEFAULT_AREA_FIELDS;
       }
@@ -237,7 +239,7 @@ export default function App() {
       const intB = Graph.readBuildings(wb).internal;
       const intLogs = Graph.readInternalLogs(wb).map((l) => calcRowInternal(l));
       setLogsInternal(intLogs);
-      if (intB.length) setBuildingsInternal(intB);
+      setBuildingsInternal(intB); // 항상 갱신 — 이전에 잘못 저장된 묵은 내부 데이터 제거
 
       setAreaP((prev) => Object.fromEntries(AREA_KEYS.map((k) => [k, appendedKeys.has(k) ? [] : (prev[k] || [])])));
       setPendingInternal([]);
