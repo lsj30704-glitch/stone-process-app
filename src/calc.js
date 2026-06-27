@@ -164,30 +164,43 @@ export const DISASTER_MANUAL = [
 ];
 
 // ---------- 발주현황 (⑥ 석재발주 시트) ----------
-// readOrderStatus가 읽은 말단 행([{dong, stone, gubun, ea, m2, m}, ...])을
-// 동별 합계 + 동 안의 석종별 소계로 재집계합니다. (입력 순서 = 시트 등장 순서 유지)
+// 구분(gubun)별로 표현 단위를 다르게 집계합니다.
+//   · 두겁          → 길이 M
+//   · 창대 + 창주위 → 길이 M (한 묶음)  ※ 저층부의 "창틀·창대"도 창호 둘레재라 여기에 포함
+//   · 그 외(벽체·P석·연마·버너 등) → 면적 ㎡
+// 새 행이 밑에 추가돼도 구분 이름만 같은 규칙이면 자동으로 같은 칸에 합산됩니다.
+const ORDER_WINDOW_RE = /(창주위|창대)/; // 창대석·창주위석·창틀·창대 포함
+
+export function orderMetric(gubun) {
+  const g = String(gubun || "");
+  if (g.includes("두겁")) return "cope";    // M
+  if (ORDER_WINDOW_RE.test(g)) return "window"; // M (창대+창주위)
+  return "area";                             // ㎡
+}
+
 export function calcOrderStatus(rows) {
   const byDongMap = new Map();
   for (const r of rows || []) {
     if (!r || !r.dong) continue;
     if (!byDongMap.has(r.dong)) byDongMap.set(r.dong, new Map());
     const stoneMap = byDongMap.get(r.dong);
-    const cur = stoneMap.get(r.stone) || { stone: r.stone, ea: 0, m2: 0, m: 0 };
-    cur.ea += Number(r.ea) || 0;
-    cur.m2 += Number(r.m2) || 0;
-    cur.m += Number(r.m) || 0;
+    const cur = stoneMap.get(r.stone) || { stone: r.stone, area: 0, window: 0, cope: 0 };
+    const metric = orderMetric(r.gubun);
+    if (metric === "cope") cur.cope += Number(r.m) || 0;
+    else if (metric === "window") cur.window += Number(r.m) || 0;
+    else cur.area += Number(r.m2) || 0;
     stoneMap.set(r.stone, cur);
   }
   const byDong = [];
-  let grand = { ea: 0, m2: 0, m: 0 };
+  let grand = { area: 0, window: 0, cope: 0 };
   for (const [dong, stoneMap] of byDongMap) {
     const stones = [...stoneMap.values()];
     const total = stones.reduce(
-      (s, x) => ({ ea: s.ea + x.ea, m2: s.m2 + x.m2, m: s.m + x.m }),
-      { ea: 0, m2: 0, m: 0 }
+      (s, x) => ({ area: s.area + x.area, window: s.window + x.window, cope: s.cope + x.cope }),
+      { area: 0, window: 0, cope: 0 }
     );
     byDong.push({ dong, stones, total });
-    grand = { ea: grand.ea + total.ea, m2: grand.m2 + total.m2, m: grand.m + total.m };
+    grand = { area: grand.area + total.area, window: grand.window + total.window, cope: grand.cope + total.cope };
   }
   return { byDong, grand, dongCount: byDong.length };
 }

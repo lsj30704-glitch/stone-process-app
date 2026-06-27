@@ -622,6 +622,7 @@ function DashScopeToggle({ scope, setScope }) {
 }
 
 function OrderDashCard({ order }) {
+  const v = (n) => (n ? fmtNum(n) : "-");
   if (!order || !order.byDong || !order.byDong.length) {
     return (
       <div className="card">
@@ -636,30 +637,30 @@ function OrderDashCard({ order }) {
         <h2>📦 발주현황 · 전체 요약</h2>
         <div className="statgrid">
           <div className="stat"><div className="label">발주 동/현장</div><div className="value">{order.dongCount}곳</div></div>
-          <div className="stat"><div className="label">총 수량</div><div className="value">{fmtNum(order.grand.ea, 0)} EA</div></div>
-          <div className="stat"><div className="label">총 환산면적</div><div className="value">{fmtNum(order.grand.m2)} ㎡</div></div>
-          <div className="stat"><div className="label">총 환산길이</div><div className="value">{fmtNum(order.grand.m)} M</div></div>
+          <div className="stat"><div className="label">면적 (벽체 등)</div><div className="value">{v(order.grand.area)} ㎡</div></div>
+          <div className="stat"><div className="label">창대·창주위</div><div className="value">{v(order.grand.window)} m</div></div>
+          <div className="stat"><div className="label">두겁</div><div className="value">{v(order.grand.cope)} m</div></div>
         </div>
       </div>
       {order.byDong.map((d) => (
         <div className="card" key={d.dong}>
           <h2>{d.dong} <span style={{ fontSize: 13, fontWeight: 400, color: "#6b7280" }}>· 발주 소계</span></h2>
           <table className="dashtable">
-            <thead><tr><th>석종</th><th>수량(EA)</th><th>면적(㎡)</th><th>길이(M)</th></tr></thead>
+            <thead><tr><th>석종</th><th>면적(㎡)</th><th>창대·창주위(m)</th><th>두겁(m)</th></tr></thead>
             <tbody>
               {d.stones.map((st) => (
                 <tr key={st.stone}>
                   <td className="dong">{st.stone}</td>
-                  <td>{fmtNum(st.ea, 0)}</td>
-                  <td>{fmtNum(st.m2)}</td>
-                  <td>{fmtNum(st.m)}</td>
+                  <td>{v(st.area)}</td>
+                  <td>{v(st.window)}</td>
+                  <td>{v(st.cope)}</td>
                 </tr>
               ))}
               <tr style={{ fontWeight: 700, background: "#eef2fb" }}>
                 <td className="dong">동 합계</td>
-                <td>{fmtNum(d.total.ea, 0)}</td>
-                <td>{fmtNum(d.total.m2)}</td>
-                <td>{fmtNum(d.total.m)}</td>
+                <td>{v(d.total.area)}</td>
+                <td>{v(d.total.window)}</td>
+                <td>{v(d.total.cope)}</td>
               </tr>
             </tbody>
           </table>
