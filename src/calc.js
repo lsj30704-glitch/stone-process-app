@@ -178,12 +178,21 @@ export function orderMetric(gubun) {
   return "area";                             // ㎡
 }
 
+// 동 이름 통합: "104동(추가)"·"104동(1차)"→"104동", "101동 호이스트"·"112동(저층부)"→기본 동번호.
+// 숫자+동 패턴을 뽑아 기본 동으로 합치고, 게스트하우스처럼 숫자 없는 건 그대로 둡니다.
+export function normalizeDong(dong) {
+  const s = String(dong || "").trim();
+  const m = s.match(/(\d+)\s*동/);
+  return m ? `${m[1]}동` : s;
+}
+
 export function calcOrderStatus(rows) {
   const byDongMap = new Map();
   for (const r of rows || []) {
     if (!r || !r.dong) continue;
-    if (!byDongMap.has(r.dong)) byDongMap.set(r.dong, new Map());
-    const stoneMap = byDongMap.get(r.dong);
+    const dong = normalizeDong(r.dong);
+    if (!byDongMap.has(dong)) byDongMap.set(dong, new Map());
+    const stoneMap = byDongMap.get(dong);
     const cur = stoneMap.get(r.stone) || { stone: r.stone, area: 0, window: 0, cope: 0 };
     const metric = orderMetric(r.gubun);
     if (metric === "cope") cur.cope += Number(r.m) || 0;
@@ -202,5 +211,16 @@ export function calcOrderStatus(rows) {
     byDong.push({ dong, stones, total });
     grand = { area: grand.area + total.area, window: grand.window + total.window, cope: grand.cope + total.cope };
   }
+  // 동 순서: 숫자(동번호) 오름차순 → 숫자 없는 이름(게스트하우스 등)은 한글순으로 뒤에
+  byDong.sort((a, b) => {
+    const na = parseInt(a.dong, 10);
+    const nb = parseInt(b.dong, 10);
+    const aNum = !isNaN(na);
+    const bNum = !isNaN(nb);
+    if (aNum && bNum) return na - nb;
+    if (aNum) return -1;
+    if (bNum) return 1;
+    return a.dong.localeCompare(b.dong, "ko");
+  });
   return { byDong, grand, dongCount: byDong.length };
 }
