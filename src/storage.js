@@ -21,6 +21,7 @@ const KEYS = {
   pendingExternal: "spm_pending_external_v1", // 아직 업로드 못한 외부 입력
   pendingInternal: "spm_pending_internal_v1",
   checklist: "spm_recovery_checklist_v1",
+  orderRows: "spm_order_rows_v1", // ⑥ 석재발주 시트에서 읽은 발주현황(동·석종·구분)
 };
 
 function get(key, fallback) {

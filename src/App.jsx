@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   BUILDINGS_EXTERNAL, BUILDINGS_INTERNAL, SEED_LOGS_EXTERNAL, SEED_LOGS_INTERNAL,
-  DISASTER_OPTIONS, REASON_CODES, THRESHOLDS,
+  DISASTER_OPTIONS, REASON_CODES, THRESHOLDS, SEED_ORDER_ROWS,
 } from "./data";
 import {
   calcRowExternal, calcRowInternal, calcExternalDashboard, calcInternalDashboard,
-  calcRecoveryPlan, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
+  calcRecoveryPlan, calcOrderStatus, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
 } from "./calc";
 import { Storage } from "./storage";
 import * as Graph from "./graphSync";
@@ -88,6 +88,7 @@ export default function App() {
   const [logsInternal, setLogsInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), initialIsDefault ? SEED_LOGS_INTERNAL : []));
   const [pendingInternal, setPendingInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
   const [checklist, setChecklist] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
+  const [orderRows, setOrderRows] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.orderRows, activeSiteId), initialIsDefault ? SEED_ORDER_ROWS : []));
 
   const dongListsArea = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, (areaB[s.key] || []).map((b) => b.dong)])), [areaB]);
   const dongListInternal = useMemo(() => [...buildingsInternal.map((b) => b.dong), EXTRA_INTERNAL_DONG], [buildingsInternal]);
@@ -118,6 +119,7 @@ export default function App() {
     setLogsInternal(Storage.get(Storage.siteKey(Storage.KEYS.logsInternal, activeSiteId), isDef ? SEED_LOGS_INTERNAL : []));
     setPendingInternal(Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
     setChecklist(Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
+    setOrderRows(Storage.get(Storage.siteKey(Storage.KEYS.orderRows, activeSiteId), isDef ? SEED_ORDER_ROWS : []));
     setSync({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.siteKey(Storage.KEYS.fileMeta, activeSiteId), {})?.lastSyncedAt || null });
     wbRef.current = null;
     itemIdRef.current = null;
@@ -130,6 +132,7 @@ export default function App() {
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.logsInternal, currentSiteIdRef.current), logsInternal); }, [logsInternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.pendingInternal, currentSiteIdRef.current), pendingInternal); }, [pendingInternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklist, currentSiteIdRef.current), checklist); }, [checklist]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.orderRows, currentSiteIdRef.current), orderRows); }, [orderRows]);
 
   useEffect(() => {
     setAreaForms((prev) => {
@@ -175,6 +178,7 @@ export default function App() {
   const areaDash = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, calcExternalDashboard(areaB[s.key] || [], areaL[s.key] || [])])), [areaB, areaL]);
   const dashInternal = useMemo(() => calcInternalDashboard(buildingsInternal, logsInternal), [buildingsInternal, logsInternal]);
   const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaL[recoveryScope] || [], new Date()), [recoveryDong, recoveryScope, areaB, areaL]);
+  const orderDash = useMemo(() => calcOrderStatus(orderRows), [orderRows]);
 
   const pendingCount = AREA_KEYS.reduce((s, k) => s + (areaP[k]?.length || 0), 0) + pendingInternal.length;
 
@@ -235,6 +239,8 @@ export default function App() {
       setAreaB(newB);
       setAreaL(newL);
       setAreaFields(newFields);
+
+      setOrderRows(result.orderRows || Graph.readOrderStatus(wb));
 
       const intB = Graph.readBuildings(wb).internal;
       const intLogs = Graph.readInternalLogs(wb).map((l) => calcRowInternal(l));
@@ -353,7 +359,7 @@ export default function App() {
           />
         )}
         {tab === "dash" && (
-          <DashTab scope={dashScope} setScope={setDashScope} areaDash={areaDash} dashInternal={dashInternal} />
+          <DashTab scope={dashScope} setScope={setDashScope} areaDash={areaDash} dashInternal={dashInternal} orderDash={orderDash} />
         )}
         {tab === "recovery" && (
           <RecoveryTab
@@ -604,12 +610,73 @@ function AreaDashCard({ scope, dash }) {
   );
 }
 
-function DashTab({ scope, setScope, areaDash, dashInternal }) {
+const DASH_TABS = [...SCOPE_TABS, { key: "order", label: "📦 발주현황" }];
+function DashScopeToggle({ scope, setScope }) {
+  return (
+    <div className="toggle2" style={{ flexWrap: "wrap" }}>
+      {DASH_TABS.map((s) => (
+        <button key={s.key} className={scope === s.key ? "active" : ""} onClick={() => setScope(s.key)}>{s.label}</button>
+      ))}
+    </div>
+  );
+}
+
+function OrderDashCard({ order }) {
+  if (!order || !order.byDong || !order.byDong.length) {
+    return (
+      <div className="card">
+        <h2>📦 발주현황</h2>
+        <p className="meta">발주 데이터가 없습니다 — 동기화하면 엑셀 ⑥ 석재발주 시트에서 불러옵니다.</p>
+      </div>
+    );
+  }
+  return (
+    <>
+      <div className="card">
+        <h2>📦 발주현황 · 전체 요약</h2>
+        <div className="statgrid">
+          <div className="stat"><div className="label">발주 동/현장</div><div className="value">{order.dongCount}곳</div></div>
+          <div className="stat"><div className="label">총 수량</div><div className="value">{fmtNum(order.grand.ea, 0)} EA</div></div>
+          <div className="stat"><div className="label">총 환산면적</div><div className="value">{fmtNum(order.grand.m2)} ㎡</div></div>
+          <div className="stat"><div className="label">총 환산길이</div><div className="value">{fmtNum(order.grand.m)} M</div></div>
+        </div>
+      </div>
+      {order.byDong.map((d) => (
+        <div className="card" key={d.dong}>
+          <h2>{d.dong} <span style={{ fontSize: 13, fontWeight: 400, color: "#6b7280" }}>· 발주 소계</span></h2>
+          <table className="dashtable">
+            <thead><tr><th>석종</th><th>수량(EA)</th><th>면적(㎡)</th><th>길이(M)</th></tr></thead>
+            <tbody>
+              {d.stones.map((st) => (
+                <tr key={st.stone}>
+                  <td className="dong">{st.stone}</td>
+                  <td>{fmtNum(st.ea, 0)}</td>
+                  <td>{fmtNum(st.m2)}</td>
+                  <td>{fmtNum(st.m)}</td>
+                </tr>
+              ))}
+              <tr style={{ fontWeight: 700, background: "#eef2fb" }}>
+                <td className="dong">동 합계</td>
+                <td>{fmtNum(d.total.ea, 0)}</td>
+                <td>{fmtNum(d.total.m2)}</td>
+                <td>{fmtNum(d.total.m)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function DashTab({ scope, setScope, areaDash, dashInternal, orderDash }) {
   const areaScope = AREA_SCOPES.find((s) => s.key === scope);
   return (
     <div>
-      <ScopeToggle scope={scope} setScope={setScope} />
-      {areaScope ? (
+      <DashScopeToggle scope={scope} setScope={setScope} />
+      {scope === "order" ? (
+        <OrderDashCard order={orderDash} />
+      ) : areaScope ? (
         <AreaDashCard scope={areaScope} dash={areaDash[scope]} />
       ) : (
         <>

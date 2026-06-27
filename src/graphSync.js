@@ -531,6 +531,81 @@ export function appendInternalRow(wb, entry) {
   return row;
 }
 
+// ===== ⑥ 석재발주 시트(발주현황) 읽기 =====
+// 시트 이름에 "발주"가 들어간 시트를 찾아, "동  석종  구분 소계" 형태의 말단(leaf) 행만
+// {dong, stone, gubun, ea, m2, m} 목록으로 반환합니다. 동별 합계·석종 소계는 앱(calc)에서
+// 이 말단 행들을 직접 재집계하므로, 사용자가 같은 형식으로 행을 추가하면 자동으로 반영됩니다.
+const ORDER_SHEET_HINT = "발주";
+const KNOWN_STONES = ["보니브라운", "스틸그레이", "마천석", "포천석"];
+
+function orderSheetCandidates(wb) {
+  const named = wb.worksheets.filter((ws) => ws && ws.name && ws.name.includes(ORDER_SHEET_HINT));
+  return named.length ? named : wb.worksheets;
+}
+
+// 라벨에서 {dong, stone, gubun} 추출. 말단 소계 행만 객체를 반환하고,
+// 석종 소계(2토막)·동 합계·총계·제목 행 등은 null.
+function parseOrderLabel(label, stoneSet) {
+  const s = String(label == null ? "" : label).trim();
+  if (!s.endsWith("소계")) return null;          // "소계"로 끝나는 행만 (합계/총계/제목 제외)
+  const body = s.slice(0, -2).trim();            // 끝의 "소계" 제거
+  // 1) 생성기 기본 포맷: 동·석종·구분 사이가 2칸 이상 공백
+  const parts = body.split(/\s{2,}/).map((x) => x.trim()).filter(Boolean);
+  if (parts.length >= 3) return { dong: parts[0], stone: parts[1], gubun: parts.slice(2).join(" ") };
+  if (parts.length === 2) return null;           // 석종 소계 행 → 말단 아님
+  // 2) 폴백: 사용자가 한 칸 공백으로 추가한 경우, 알려진 석종명으로 동/구분 경계 추정
+  for (const st of stoneSet) {
+    const i = body.indexOf(st);
+    if (i > 0) {
+      const dong = body.slice(0, i).trim();
+      const gubun = body.slice(i + st.length).trim();
+      if (dong && gubun) return { dong, stone: st, gubun };
+    }
+  }
+  return null;
+}
+
+function readOrderLeavesFromSheet(ws) {
+  const rowsRaw = [];
+  const maxRow = ws.rowCount || 0;
+  for (let r = 1; r <= maxRow; r++) {
+    rowsRaw.push({
+      label: rawCell(ws, `A${r}`),
+      ea: rawCell(ws, `B${r}`),
+      m2: rawCell(ws, `C${r}`),
+      m: rawCell(ws, `D${r}`),
+    });
+  }
+  // 1차 패스: 표에 등장하는 석종 집합 수집(폴백 매칭용)
+  const stoneSet = new Set(KNOWN_STONES);
+  for (const row of rowsRaw) {
+    const p = parseOrderLabel(row.label, []);
+    if (p) stoneSet.add(p.stone);
+  }
+  // 2차 패스: 말단(동·석종·구분 소계) 행만 추출
+  const out = [];
+  for (const row of rowsRaw) {
+    const p = parseOrderLabel(row.label, stoneSet);
+    if (!p) continue;
+    const ea = Number(row.ea);
+    if (!isFinite(ea)) continue;
+    out.push({ dong: p.dong, stone: p.stone, gubun: p.gubun, ea, m2: Number(row.m2) || 0, m: Number(row.m) || 0 });
+  }
+  return out;
+}
+
+// "발주"가 들어간 시트가 여러 개(⑤ 면별, ⑥ 시트별)일 수 있으므로,
+// 말단(구분 소계) 행이 가장 많이 추출되는 시트를 발주현황 원천으로 채택합니다.
+// → 시트 이름이 바뀌거나 순서가 달라져도 올바른 시트(⑥)를 자동으로 고릅니다.
+export function readOrderStatus(wb) {
+  let best = [];
+  for (const ws of orderSheetCandidates(wb)) {
+    const leaves = readOrderLeavesFromSheet(ws);
+    if (leaves.length > best.length) best = leaves;
+  }
+  return best;
+}
+
 // 전체 흐름: 로그인 → 다운로드 → 파싱 → 앱 상태 반환 (워크북 객체도 함께 보관해야 재업로드 가능)
 // site: { id, name, filePath, fileName } — 어떤 현장의 OneDrive 파일을 동기화할지 지정
 export async function syncDown(site) {
@@ -541,7 +616,8 @@ export async function syncDown(site) {
   const buildings = readBuildings(wb);
   const logsExternal = readExternalLogs(wb);
   const logsInternal = readInternalLogs(wb);
-  return { wb, itemId, buildings, logsExternal, logsInternal, syncedAt: new Date().toISOString() };
+  const orderRows = readOrderStatus(wb);
+  return { wb, itemId, buildings, logsExternal, logsInternal, orderRows, syncedAt: new Date().toISOString() };
 }
 
 export async function syncUp(wb, itemId) {

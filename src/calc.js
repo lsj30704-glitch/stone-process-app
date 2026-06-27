@@ -162,3 +162,32 @@ export const DISASTER_MANUAL = [
   { step: "STEP 4", title: "복구 계획 수립", detail: "만회계획 자동 산출로 잔여량·필요인원 확인 · 다음날부터 만회 일일 생산량 목표 설정 · 필요시 2교대/주말 특근 계획" },
   { step: "STEP 5", title: "만회 실행 & 모니터링", detail: "매일 실적 입력 · 달성률현황 대시보드로 만회 진행 확인 · 달성률 80% 미만 지속 시 공기연장/추가인원 협의" },
 ];
+
+// ---------- 발주현황 (⑥ 석재발주 시트) ----------
+// readOrderStatus가 읽은 말단 행([{dong, stone, gubun, ea, m2, m}, ...])을
+// 동별 합계 + 동 안의 석종별 소계로 재집계합니다. (입력 순서 = 시트 등장 순서 유지)
+export function calcOrderStatus(rows) {
+  const byDongMap = new Map();
+  for (const r of rows || []) {
+    if (!r || !r.dong) continue;
+    if (!byDongMap.has(r.dong)) byDongMap.set(r.dong, new Map());
+    const stoneMap = byDongMap.get(r.dong);
+    const cur = stoneMap.get(r.stone) || { stone: r.stone, ea: 0, m2: 0, m: 0 };
+    cur.ea += Number(r.ea) || 0;
+    cur.m2 += Number(r.m2) || 0;
+    cur.m += Number(r.m) || 0;
+    stoneMap.set(r.stone, cur);
+  }
+  const byDong = [];
+  let grand = { ea: 0, m2: 0, m: 0 };
+  for (const [dong, stoneMap] of byDongMap) {
+    const stones = [...stoneMap.values()];
+    const total = stones.reduce(
+      (s, x) => ({ ea: s.ea + x.ea, m2: s.m2 + x.m2, m: s.m + x.m }),
+      { ea: 0, m2: 0, m: 0 }
+    );
+    byDong.push({ dong, stones, total });
+    grand = { ea: grand.ea + total.ea, m2: grand.m2 + total.m2, m: grand.m + total.m };
+  }
+  return { byDong, grand, dongCount: byDong.length };
+}
