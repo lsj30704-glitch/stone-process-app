@@ -36,7 +36,7 @@ export const THRESHOLDS = {
   danger: 0.7,
   disasterExemption: 1.0,
   recoveryDays: 5,
-  productivityPerWorker: 8.5,
+  productivityPerWorker: 10,
 };
 
 export const DISASTER_OPTIONS = ["N (정상)", "Y (천재지변)", "P (부분영향)"];
@@ -144,4 +144,13 @@ export const SEED_ORDER_ROWS = [
   { dong: "111동", stone: "스틸그레이", gubun: "벽체", ea: 476, m2: 215.96, m: 408.76 },
   { dong: "111동", stone: "스틸그레이", gubun: "두겁", ea: 120, m2: 16.05, m: 111.45 },
   { dong: "111동", stone: "스틸그레이", gubun: "창주위", ea: 9, m2: 1.6, m: 10.82 },
-  { dong: "111동", stone: "스틸그레이", gubun: "창대", ea: 3, m2: 0.71, m: 3.47 },];
+  { dong: "111동", stone: "스틸그레이", gubun: "창대", ea: 3, m2: 0.71, m: 3.47 },
+  // ⑥ 근생2 발주 시드 (동기화 전 표시용 — 실제 엑셀 ⑥석재발주_시트별 값. 동기화하면 최신값으로 대체됨)
+  { dong: "근생2", stone: "스틸그레이", gubun: "벽체", ea: 160, m2: 64.24, m: 5.2 },
+  { dong: "근생2", stone: "스틸그레이", gubun: "두겁석", ea: 88, m2: 51.33, m: 6.93 },
+  { dong: "근생2", stone: "스틸그레이", gubun: "창주위", ea: 6, m2: 0.88, m: 0.05 },
+  { dong: "근생2", stone: "스틸그레이", gubun: "창대", ea: 65, m2: 27.84, m: 2.25 },
+  { dong: "근생2", stone: "포천석", gubun: "벽체", ea: 358, m2: 159.75, m: 12.94 },
+  { dong: "근생2", stone: "포천석", gubun: "두겁석", ea: 53, m2: 30.02, m: 4.05 },
+  { dong: "근생2", stone: "포천석", gubun: "창주위", ea: 20, m2: 4.32, m: 0.23 },
+  { dong: "근생2", stone: "포천석", gubun: "창대", ea: 4, m2: 1.08, m: 0.09 },];

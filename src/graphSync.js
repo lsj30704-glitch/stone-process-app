@@ -354,6 +354,38 @@ export function readBuildings(wb) {
   return { external, internal };
 }
 
+// ①기준정보의 달성률 경보/만회 설정값을 라벨(부분일치)로 찾아 읽습니다.
+// 위쪽에 블록이 추가돼 행이 밀려도 안전하도록 셀 위치를 고정하지 않고 라벨 텍스트로 검색합니다.
+// 엑셀 구조상 라벨은 C열, 값은 바로 오른쪽 D열. %값(95 등)은 /100 해서 소수로 저장합니다.
+// 못 찾은 값은 결과 객체에서 생략 → 앱이 기본 THRESHOLDS로 채웁니다.
+export function readThresholds(wb) {
+  const ws = wb.getWorksheet(SHEET_BASE);
+  const out = {};
+  if (!ws) return out;
+  const specs = [
+    { match: "정상기준", key: "normal", pct: true },
+    { match: "주의기준", key: "caution", pct: true },
+    { match: "위험기준", key: "danger", pct: true },
+    { match: "천재지변면책", key: "disasterExemption", pct: true },
+    { match: "만회허용일수", key: "recoveryDays", pct: false },
+    { match: "1인당일일시공량", key: "productivityPerWorker", pct: false },
+  ];
+  const maxRow = ws.rowCount || 300;
+  for (let r = 1; r <= maxRow; r++) {
+    const label = rawCell(ws, `C${r}`);
+    if (typeof label !== "string" || !label.trim()) continue;
+    const norm = label.replace(/\s/g, "");
+    for (const sp of specs) {
+      if (out[sp.key] !== undefined) continue;
+      if (norm.includes(sp.match)) {
+        const v = Number(rawCell(ws, `D${r}`));
+        if (isFinite(v)) out[sp.key] = sp.pct ? v / 100 : v;
+      }
+    }
+  }
+  return out;
+}
+
 // ===== 공사 범위(scope) 일반화 — 외부/호이스트/부대시설처럼 면적(m²)형 시트 공용 =====
 // 면적형 일일실적 시트(외부와 동일한 컬럼 구조)를 시트명만 받아 일반적으로 읽음.
 export function readAreaLogs(wb, sheetName) {
@@ -552,13 +584,16 @@ function parseOrderLabel(label, stoneSet) {
   // 1) 생성기 기본 포맷: 동·석종·구분 사이가 2칸 이상 공백
   const parts = body.split(/\s{2,}/).map((x) => x.trim()).filter(Boolean);
   if (parts.length >= 3) return { dong: parts[0], stone: parts[1], gubun: parts.slice(2).join(" ") };
-  if (parts.length === 2) return null;           // 석종 소계 행 → 말단 아님
-  // 2) 폴백: 사용자가 한 칸 공백으로 추가한 경우, 알려진 석종명으로 동/구분 경계 추정
+  // 2) 폴백: 동·석종·구분이 2칸 미만 공백으로 붙어 2토막 이하로 쪼개진 경우
+  //    (예: "근생2   스틸그레이 벽체" → ["근생2","스틸그레이 벽체"])에도 버리지 않고
+  //    알려진 석종명으로 동/구분 경계를 추정. 석종 소계("스틸그레이 소계")는 석종 뒤가
+  //    비어 gubun이 없으므로 여기서 자동 제외됨.
+  const scanText = parts.length === 2 ? parts.join(" ") : body;
   for (const st of stoneSet) {
-    const i = body.indexOf(st);
+    const i = scanText.indexOf(st);
     if (i > 0) {
-      const dong = body.slice(0, i).trim();
-      const gubun = body.slice(i + st.length).trim();
+      const dong = scanText.slice(0, i).trim();
+      const gubun = scanText.slice(i + st.length).trim();
       if (dong && gubun) return { dong, stone: st, gubun };
     }
   }
@@ -617,7 +652,8 @@ export async function syncDown(site) {
   const logsExternal = readExternalLogs(wb);
   const logsInternal = readInternalLogs(wb);
   const orderRows = readOrderStatus(wb);
-  return { wb, itemId, buildings, logsExternal, logsInternal, orderRows, syncedAt: new Date().toISOString() };
+  const thresholds = readThresholds(wb);
+  return { wb, itemId, buildings, logsExternal, logsInternal, orderRows, thresholds, syncedAt: new Date().toISOString() };
 }
 
 export async function syncUp(wb, itemId) {

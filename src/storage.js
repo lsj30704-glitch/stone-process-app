@@ -22,6 +22,7 @@ const KEYS = {
   pendingInternal: "spm_pending_internal_v1",
   checklist: "spm_recovery_checklist_v1",
   orderRows: "spm_order_rows_v1", // ⑥ 석재발주 시트에서 읽은 발주현황(동·석종·구분)
+  thresholds: "spm_thresholds_v1", // ①기준정보에서 읽은 경보/만회 설정값(1인당 생산성 등)
 };
 
 function get(key, fallback) {

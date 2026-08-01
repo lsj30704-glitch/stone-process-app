@@ -1,10 +1,10 @@
 // 엑셀 ③달성률현황 / 내부 달성률현황 / ④만회계획·대응 시트의 수식을 그대로 옮긴 계산 로직.
 import { THRESHOLDS } from "./data";
 
-export function statusBadge(rate) {
+export function statusBadge(rate, th = THRESHOLDS) {
   if (rate === "" || rate === null || rate === undefined) return { label: "–", color: "#999" };
-  if (rate >= THRESHOLDS.normal) return { label: "✅ 정상", color: "#2e7d32" };
-  if (rate >= THRESHOLDS.caution) return { label: "⚠️ 주의", color: "#e8a700" };
+  if (rate >= th.normal) return { label: "✅ 정상", color: "#2e7d32" };
+  if (rate >= th.caution) return { label: "⚠️ 주의", color: "#e8a700" };
   return { label: "🚨 위험", color: "#d32f2f" };
 }
 
@@ -39,7 +39,7 @@ export function calcRowExternal(entry, buildings) {
 }
 
 // ③달성률현황
-export function calcExternalDashboard(buildings, logs) {
+export function calcExternalDashboard(buildings, logs, th = THRESHOLDS) {
   const rows = logs.map((l) => calcRowExternal(l, buildings));
   const totalPlanArea = buildings.reduce((s, b) => s + b.totalArea, 0);
   const cumActual = rows.reduce((s, r) => s + (Number(r.actual) || 0), 0);
@@ -62,7 +62,7 @@ export function calcExternalDashboard(buildings, logs) {
       rate,
       remain,
       endDate: b.endDate,
-      status: statusBadge(rate),
+      status: statusBadge(rate, th),
     };
   });
 
@@ -83,7 +83,7 @@ export function calcRowInternal(entry) {
 }
 
 // 내부 달성률현황
-export function calcInternalDashboard(buildingsInternal, logs) {
+export function calcInternalDashboard(buildingsInternal, logs, th = THRESHOLDS) {
   const rows = logs.map((l) => calcRowInternal(l));
   const totalUnits = buildingsInternal.reduce((s, b) => s + b.totalUnits, 0);
   const optionUnits = buildingsInternal.reduce((s, b) => s + b.optionUnits, 0);
@@ -106,7 +106,7 @@ export function calcInternalDashboard(buildingsInternal, logs) {
       cumActual: buildingActual,
       rate,
       remain,
-      status: statusBadge(rate),
+      status: statusBadge(rate, th),
     };
   });
 
@@ -115,7 +115,7 @@ export function calcInternalDashboard(buildingsInternal, logs) {
 
 // ---------- ④만회계획·대응 ----------
 
-export function calcRecoveryPlan(dong, buildings, logs, today = new Date()) {
+export function calcRecoveryPlan(dong, buildings, logs, today = new Date(), th = THRESHOLDS) {
   const b = buildings.find((x) => x.dong === dong);
   if (!b) return null;
   const cumActual = logs
@@ -128,7 +128,7 @@ export function calcRecoveryPlan(dong, buildings, logs, today = new Date()) {
   const remainDays = Math.max(0, daysBetween(today, endDate));
   const availableDays = Math.max(1, Math.round(remainDays * 0.85));
   const baseWorkers = b.baseWorkers;
-  const productivity = THRESHOLDS.productivityPerWorker;
+  const productivity = th.productivityPerWorker;
   const currentCapacity = baseWorkers * productivity;
   const neededDaily = remainArea === 0 ? "완료" : remainArea / availableDays;
   const extraWorkers = neededDaily === "완료" ? 0 : Math.max(0, Math.ceil(neededDaily / productivity) - baseWorkers);

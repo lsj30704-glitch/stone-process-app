@@ -68,7 +68,7 @@ function loadAreaMap(kind, siteId, isDefault) {
 }
 
 export default function App() {
-  const [tab, setTab] = useState("input");
+  const [tab, setTab] = useState("dash");
   const [inputScope, setInputScope] = useState("external");
   const [dashScope, setDashScope] = useState("external");
   const [recoveryScope, setRecoveryScope] = useState("external");
@@ -89,6 +89,7 @@ export default function App() {
   const [pendingInternal, setPendingInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
   const [checklist, setChecklist] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
   const [orderRows, setOrderRows] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.orderRows, activeSiteId), initialIsDefault ? SEED_ORDER_ROWS : []));
+  const [thresholds, setThresholds] = useState(() => ({ ...THRESHOLDS, ...Storage.get(Storage.siteKey(Storage.KEYS.thresholds, activeSiteId), {}) }));
 
   const dongListsArea = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, (areaB[s.key] || []).map((b) => b.dong)])), [areaB]);
   const dongListInternal = useMemo(() => [...buildingsInternal.map((b) => b.dong), EXTRA_INTERNAL_DONG], [buildingsInternal]);
@@ -120,6 +121,7 @@ export default function App() {
     setPendingInternal(Storage.get(Storage.siteKey(Storage.KEYS.pendingInternal, activeSiteId), []));
     setChecklist(Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
     setOrderRows(Storage.get(Storage.siteKey(Storage.KEYS.orderRows, activeSiteId), isDef ? SEED_ORDER_ROWS : []));
+    setThresholds({ ...THRESHOLDS, ...Storage.get(Storage.siteKey(Storage.KEYS.thresholds, activeSiteId), {}) });
     setSync({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.siteKey(Storage.KEYS.fileMeta, activeSiteId), {})?.lastSyncedAt || null });
     wbRef.current = null;
     itemIdRef.current = null;
@@ -133,6 +135,7 @@ export default function App() {
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.pendingInternal, currentSiteIdRef.current), pendingInternal); }, [pendingInternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklist, currentSiteIdRef.current), checklist); }, [checklist]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.orderRows, currentSiteIdRef.current), orderRows); }, [orderRows]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.thresholds, currentSiteIdRef.current), thresholds); }, [thresholds]);
 
   useEffect(() => {
     setAreaForms((prev) => {
@@ -175,9 +178,9 @@ export default function App() {
     }
   }, [justLoggedIn, account]);
 
-  const areaDash = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, calcExternalDashboard(areaB[s.key] || [], areaL[s.key] || [])])), [areaB, areaL]);
-  const dashInternal = useMemo(() => calcInternalDashboard(buildingsInternal, logsInternal), [buildingsInternal, logsInternal]);
-  const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaL[recoveryScope] || [], new Date()), [recoveryDong, recoveryScope, areaB, areaL]);
+  const areaDash = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, calcExternalDashboard(areaB[s.key] || [], areaL[s.key] || [], thresholds)])), [areaB, areaL, thresholds]);
+  const dashInternal = useMemo(() => calcInternalDashboard(buildingsInternal, logsInternal, thresholds), [buildingsInternal, logsInternal, thresholds]);
+  const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaL[recoveryScope] || [], new Date(), thresholds), [recoveryDong, recoveryScope, areaB, areaL, thresholds]);
   const orderDash = useMemo(() => calcOrderStatus(orderRows), [orderRows]);
 
   const pendingCount = AREA_KEYS.reduce((s, k) => s + (areaP[k]?.length || 0), 0) + pendingInternal.length;
@@ -241,6 +244,7 @@ export default function App() {
       setAreaFields(newFields);
 
       setOrderRows(result.orderRows || Graph.readOrderStatus(wb));
+      setThresholds({ ...THRESHOLDS, ...(result.thresholds || Graph.readThresholds(wb)) });
 
       const intB = Graph.readBuildings(wb).internal;
       const intLogs = Graph.readInternalLogs(wb).map((l) => calcRowInternal(l));
@@ -366,10 +370,11 @@ export default function App() {
             recoveryScope={recoveryScope} setRecoveryScope={setRecoveryScope}
             recoveryDong={recoveryDong} setRecoveryDong={setRecoveryDong} recovery={recovery}
             checklist={checklist} toggleCheck={toggleCheck} dongList={dongListsArea[recoveryScope] || []}
+            thresholds={thresholds}
           />
         )}
         {tab === "base" && (
-          <BaseTab areaB={areaB} buildingsInternal={buildingsInternal} />
+          <BaseTab areaB={areaB} buildingsInternal={buildingsInternal} thresholds={thresholds} />
         )}
         {tab === "sync" && (
           <SyncTab
@@ -388,10 +393,10 @@ export default function App() {
       </div>
 
       <div className="tabbar">
-        <TabBtn active={tab === "input"} onClick={() => setTab("input")} icon="✏️" label="입력" />
         <TabBtn active={tab === "dash"} onClick={() => setTab("dash")} icon="📊" label="현황" />
         <TabBtn active={tab === "recovery"} onClick={() => setTab("recovery")} icon="🔄" label="만회계획" />
         <TabBtn active={tab === "base"} onClick={() => setTab("base")} icon="📋" label="기준정보" />
+        <TabBtn active={tab === "input"} onClick={() => setTab("input")} icon="✏️" label="입력" />
         <TabBtn active={tab === "sync"} onClick={() => setTab("sync")} icon="☁️" label="동기화" />
       </div>
     </div>
@@ -715,11 +720,12 @@ function DashTab({ scope, setScope, areaDash, dashInternal, orderDash }) {
   );
 }
 
-function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecoveryDong, recovery, checklist, toggleCheck, dongList }) {
+function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecoveryDong, recovery, checklist, toggleCheck, dongList, thresholds }) {
   return (
     <div>
       <div className="card">
         <h2>만회계획 자동 산출</h2>
+        <div className="banner info" style={{ marginBottom: 10 }}>1인당 일일생산성 기준: {thresholds.productivityPerWorker}㎡ (엑셀 ①기준정보 값)</div>
         <Field label="공사 범위">
           <select value={recoveryScope} onChange={(e) => setRecoveryScope(e.target.value)}>
             {AREA_SCOPES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
@@ -742,6 +748,7 @@ function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecover
             <div className="stat"><div className="label">실 가용 작업일</div><div className="value">{recovery.availableDays}일</div></div>
             <div className="stat"><div className="label">기준 투입인원</div><div className="value">{recovery.baseWorkers}명</div></div>
             <div className="stat"><div className="label">현 인원 일일생산가능량</div><div className="value">{fmtNum(recovery.currentCapacity)} m²</div></div>
+            <div className="stat"><div className="label">1인당 일일생산성</div><div className="value">{fmtNum(recovery.productivity)} m²</div></div>
             <div className="stat"><div className="label">만회 필요 일일생산량</div><div className="value">{typeof recovery.neededDaily === "number" ? fmtNum(recovery.neededDaily) + " m²" : recovery.neededDaily}</div></div>
             <div className="stat"><div className="label">만회 필요 추가인원</div><div className="value">{recovery.extraWorkers}명</div></div>
           </div>
@@ -774,7 +781,7 @@ function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecover
   );
 }
 
-function BaseTab({ areaB, buildingsInternal }) {
+function BaseTab({ areaB, buildingsInternal, thresholds }) {
   return (
     <div>
       {AREA_SCOPES.map((s) => (
@@ -816,10 +823,10 @@ function BaseTab({ areaB, buildingsInternal }) {
       <div className="card">
         <h3>달성률 경보 기준</h3>
         <div className="statgrid">
-          <div className="stat"><div className="label">정상 기준</div><div className="value">{fmtPct(THRESHOLDS.normal)}</div></div>
-          <div className="stat"><div className="label">주의 기준</div><div className="value">{fmtPct(THRESHOLDS.caution)}</div></div>
-          <div className="stat"><div className="label">1인당 일일생산성</div><div className="value">{THRESHOLDS.productivityPerWorker} m²</div></div>
-          <div className="stat"><div className="label">만회 허용일수</div><div className="value">{THRESHOLDS.recoveryDays}일</div></div>
+          <div className="stat"><div className="label">정상 기준</div><div className="value">{fmtPct(thresholds.normal)}</div></div>
+          <div className="stat"><div className="label">주의 기준</div><div className="value">{fmtPct(thresholds.caution)}</div></div>
+          <div className="stat"><div className="label">1인당 일일생산성</div><div className="value">{thresholds.productivityPerWorker} m²</div></div>
+          <div className="stat"><div className="label">만회 허용일수</div><div className="value">{thresholds.recoveryDays}일</div></div>
         </div>
       </div>
     </div>
