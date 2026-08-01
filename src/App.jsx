@@ -725,7 +725,13 @@ function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecover
     <div>
       <div className="card">
         <h2>만회계획 자동 산출</h2>
-        <div className="banner info" style={{ marginBottom: 10 }}>1인당 일일생산성 기준: {thresholds.productivityPerWorker}㎡ (엑셀 ①기준정보 값)</div>
+        {recovery && (
+          <div className="banner info" style={{ marginBottom: 10 }}>
+            1인당 일일생산성: {fmtNum(recovery.productivity)}㎡/명 — {recovery.productivitySource === "actual"
+              ? `실행 생산성 (누적실적 ${fmtNum(recovery.cumActual)}㎡ ÷ 실작업 투입 ${fmtNum(recovery.cumWorkers, 0)}명, 동별)`
+              : `실적 없음 → 엑셀 ①기준정보 기준값 ${thresholds.productivityPerWorker}㎡`}
+          </div>
+        )}
         <Field label="공사 범위">
           <select value={recoveryScope} onChange={(e) => setRecoveryScope(e.target.value)}>
             {AREA_SCOPES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
@@ -825,7 +831,7 @@ function BaseTab({ areaB, buildingsInternal, thresholds }) {
         <div className="statgrid">
           <div className="stat"><div className="label">정상 기준</div><div className="value">{fmtPct(thresholds.normal)}</div></div>
           <div className="stat"><div className="label">주의 기준</div><div className="value">{fmtPct(thresholds.caution)}</div></div>
-          <div className="stat"><div className="label">1인당 일일생산성</div><div className="value">{thresholds.productivityPerWorker} m²</div></div>
+          <div className="stat"><div className="label">1인당 일일생산성(기준)</div><div className="value">{thresholds.productivityPerWorker} m²</div></div>
           <div className="stat"><div className="label">만회 허용일수</div><div className="value">{thresholds.recoveryDays}일</div></div>
         </div>
       </div>

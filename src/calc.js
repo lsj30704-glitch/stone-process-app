@@ -118,9 +118,19 @@ export function calcInternalDashboard(buildingsInternal, logs, th = THRESHOLDS) 
 export function calcRecoveryPlan(dong, buildings, logs, today = new Date(), th = THRESHOLDS) {
   const b = buildings.find((x) => x.dong === dong);
   if (!b) return null;
-  const cumActual = logs
-    .filter((l) => l.dong === dong)
-    .reduce((s, l) => s + (Number(l.actual) || 0), 0);
+  const dongLogs = logs.filter((l) => l.dong === dong);
+  const cumActual = dongLogs.reduce((s, l) => s + (Number(l.actual) || 0), 0);
+  // 실행 일일생산성(엑셀 ④만회계획 C16)과 동일 기준:
+  //   1인당 생산성 = 누적실적 ÷ SUMIFS(투입인원계, 실적>0)
+  // 즉 "실적이 발생한 날"의 투입인원(man-day)만 분모로 삼는다.
+  // (자재반입·천재지변 등 실적 0인 날의 인원은 제외 → 실제로 시공한 팀의 1인당 시공량)
+  const cumWorkers = dongLogs.reduce(
+    (s, l) =>
+      Number(l.actual) > 0
+        ? s + (Number(l.masonry) || 0) + (Number(l.caulking) || 0) + (Number(l.truss) || 0) + (Number(l.scaffold) || 0)
+        : s,
+    0
+  );
   const planArea = b.totalArea;
   const currentRate = planArea > 0 ? cumActual / planArea : 0;
   const remainArea = Math.max(0, planArea - cumActual);
@@ -128,7 +138,11 @@ export function calcRecoveryPlan(dong, buildings, logs, today = new Date(), th =
   const remainDays = Math.max(0, daysBetween(today, endDate));
   const availableDays = Math.max(1, Math.round(remainDays * 0.85));
   const baseWorkers = b.baseWorkers;
-  const productivity = th.productivityPerWorker;
+  // 1인당 일일생산성은 동마다 다름 — 실제 누적 실적(㎡) ÷ 실제 누적 투입인원(man-day).
+  // 아직 투입 실적이 없는 동은 엑셀 ①기준정보의 기준값(1인당 일일 시공량)으로 폴백.
+  const hasActual = cumWorkers > 0 && cumActual > 0;
+  const productivity = hasActual ? cumActual / cumWorkers : th.productivityPerWorker;
+  const productivitySource = hasActual ? "actual" : "base";
   const currentCapacity = baseWorkers * productivity;
   const neededDaily = remainArea === 0 ? "완료" : remainArea / availableDays;
   const extraWorkers = neededDaily === "완료" ? 0 : Math.max(0, Math.ceil(neededDaily / productivity) - baseWorkers);
@@ -139,8 +153,8 @@ export function calcRecoveryPlan(dong, buildings, logs, today = new Date(), th =
   else verdict = "🚨 대폭 증원 또는 공기연장 검토";
 
   return {
-    dong, planArea, cumActual, currentRate, remainArea, endDate, remainDays,
-    availableDays, baseWorkers, productivity, currentCapacity, neededDaily, extraWorkers, verdict,
+    dong, planArea, cumActual, cumWorkers, currentRate, remainArea, endDate, remainDays,
+    availableDays, baseWorkers, productivity, productivitySource, currentCapacity, neededDaily, extraWorkers, verdict,
   };
 }
 
