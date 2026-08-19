@@ -25,6 +25,8 @@ const KEYS = {
   thresholds: "spm_thresholds_v1", // ①기준정보에서 읽은 경보/만회 설정값(1인당 생산성 등)
   achvExternal: "spm_achv_external_v1", // ③달성률현황 시트에서 읽은 동별 달성률 표
   achvInternal: "spm_achv_internal_v1", // 내부 달성률현황 시트에서 읽은 동별 달성률 표
+  checklist2: "spm_gate_checklist_v1", // ⑦착수체크리스트 (동별 선행공정 게이트)
+  checklistDirty: "spm_gate_checklist_dirty_v1", // 앱에서 수정됨 → 다음 동기화 때 엑셀에 씀
 };
 
 function get(key, fallback) {

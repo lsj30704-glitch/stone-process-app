@@ -6,6 +6,7 @@ import {
 import {
   calcRowExternal, calcRowInternal, calcExternalDashboard, calcInternalDashboard,
   calcRecoveryPlan, calcOrderStatus, mergeAchievement, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
+  calcScheduleStatus, calcManpowerCurve, calcClaimSummary, GATE_KEYS, GATE_LABELS,
 } from "./calc";
 import { Storage } from "./storage";
 import * as Graph from "./graphSync";
@@ -93,6 +94,9 @@ export default function App() {
   // 엑셀 ③달성률현황 / 내부 달성률현황 시트에서 읽어온 동별 달성률 표 (없으면 null → 기존 재계산으로 폴백)
   const [achvExternal, setAchvExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.achvExternal, activeSiteId), null));
   const [achvInternal, setAchvInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.achvInternal, activeSiteId), null));
+  // 착수 선행공정 체크리스트 (엑셀 ⑦착수체크리스트 시트와 동기화)
+  const [gateList, setGateList] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklist2, activeSiteId), []));
+  const [checklistDirty, setChecklistDirty] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklistDirty, activeSiteId), false));
 
   const dongListsArea = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, (areaB[s.key] || []).map((b) => b.dong)])), [areaB]);
   const dongListInternal = useMemo(() => [...buildingsInternal.map((b) => b.dong), EXTRA_INTERNAL_DONG], [buildingsInternal]);
@@ -127,6 +131,8 @@ export default function App() {
     setThresholds({ ...THRESHOLDS, ...Storage.get(Storage.siteKey(Storage.KEYS.thresholds, activeSiteId), {}) });
     setAchvExternal(Storage.get(Storage.siteKey(Storage.KEYS.achvExternal, activeSiteId), null));
     setAchvInternal(Storage.get(Storage.siteKey(Storage.KEYS.achvInternal, activeSiteId), null));
+    setGateList(Storage.get(Storage.siteKey(Storage.KEYS.checklist2, activeSiteId), []));
+    setChecklistDirty(Storage.get(Storage.siteKey(Storage.KEYS.checklistDirty, activeSiteId), false));
     setSync({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.siteKey(Storage.KEYS.fileMeta, activeSiteId), {})?.lastSyncedAt || null });
     wbRef.current = null;
     itemIdRef.current = null;
@@ -143,6 +149,8 @@ export default function App() {
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.thresholds, currentSiteIdRef.current), thresholds); }, [thresholds]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.achvExternal, currentSiteIdRef.current), achvExternal); }, [achvExternal]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.achvInternal, currentSiteIdRef.current), achvInternal); }, [achvInternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklist2, currentSiteIdRef.current), gateList); }, [gateList]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklistDirty, currentSiteIdRef.current), checklistDirty); }, [checklistDirty]);
 
   useEffect(() => {
     setAreaForms((prev) => {
@@ -200,6 +208,14 @@ export default function App() {
   const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaL[recoveryScope] || [], new Date(), thresholds), [recoveryDong, recoveryScope, areaB, areaL, thresholds]);
   const orderDash = useMemo(() => calcOrderStatus(orderRows), [orderRows]);
 
+  // 공기 관리 — 착수지연/공기손실/인력소요/클레임. 외부(아파트) 기준.
+  const schedule = useMemo(
+    () => calcScheduleStatus(areaB.external || [], areaL.external || [], gateList, thresholds, new Date()),
+    [areaB, areaL, gateList, thresholds]
+  );
+  const manpower = useMemo(() => calcManpowerCurve(schedule, areaL.external || [], new Date()), [schedule, areaL]);
+  const claim = useMemo(() => calcClaimSummary(schedule, areaL.external || []), [schedule, areaL]);
+
   const pendingCount = AREA_KEYS.reduce((s, k) => s + (areaP[k]?.length || 0), 0) + pendingInternal.length;
 
   async function doLogin() {
@@ -237,6 +253,12 @@ export default function App() {
       for (const entry of pendingInternal) Graph.appendInternalRow(wb, entry);
       if (pendingInternal.length) anyPending = true;
 
+      // 체크리스트를 앱에서 고쳤으면 엑셀 ⑦착수체크리스트 시트에 반영 후 업로드
+      if (checklistDirty && gateList.length) {
+        Graph.writeChecklist(wb, gateList);
+        anyPending = true;
+      }
+
       if (anyPending) {
         setSync((s) => ({ ...s, message: "변경사항 업로드 중..." }));
         await Graph.syncUp(wb, itemId);
@@ -259,6 +281,10 @@ export default function App() {
       setAreaB(newB);
       setAreaL(newL);
       setAreaFields(newFields);
+
+      const sheetChecklist = Graph.readChecklist(wb);
+      if (sheetChecklist.length || !checklistDirty) setGateList(sheetChecklist);
+      setChecklistDirty(false);
 
       setAchvExternal(result.achvExternal ?? Graph.readAchievement(wb, Graph.SHEET_ACHV_EXTERNAL));
       setAchvInternal(result.achvInternal ?? Graph.readAchievement(wb, Graph.SHEET_ACHV_INTERNAL));
@@ -306,7 +332,9 @@ export default function App() {
 
   function saveArea(key) {
     const form = areaForms[key];
-    if (!form || !form.dong) return;
+    // 동은 비워둘 수 있다(천재지변·조업불가일). 날짜만 있으면 저장한다.
+    // 빈 동은 계산 시 직전 작업 동을 물려받는다. — calc.expandLogDongs
+    if (!form || !form.date) return;
     const entry = {
       id: `local-${Date.now()}`,
       date: form.date,
@@ -393,6 +421,13 @@ export default function App() {
             thresholds={thresholds}
           />
         )}
+        {tab === "schedule" && (
+          <ScheduleTab
+            schedule={schedule} manpower={manpower} claim={claim}
+            checklist={gateList}
+            onChangeChecklist={(next) => { setGateList(next); setChecklistDirty(true); }}
+          />
+        )}
         {tab === "base" && (
           <BaseTab areaB={areaB} buildingsInternal={buildingsInternal} thresholds={thresholds} />
         )}
@@ -415,11 +450,386 @@ export default function App() {
       <div className="tabbar">
         <TabBtn active={tab === "dash"} onClick={() => setTab("dash")} icon="📊" label="현황" />
         <TabBtn active={tab === "recovery"} onClick={() => setTab("recovery")} icon="🔄" label="만회계획" />
+        <TabBtn active={tab === "schedule"} onClick={() => setTab("schedule")} icon="⏱️" label="공기관리" />
         <TabBtn active={tab === "base"} onClick={() => setTab("base")} icon="📋" label="기준정보" />
         <TabBtn active={tab === "input"} onClick={() => setTab("input")} icon="✏️" label="입력" />
         <TabBtn active={tab === "sync"} onClick={() => setTab("sync")} icon="☁️" label="동기화" />
       </div>
     </div>
+  );
+}
+
+// ============================================================================
+// 공기관리 탭 — 인력 소요 곡선 / 착수 체크리스트 / 공기연장 클레임
+// ============================================================================
+
+// dataviz 스킬의 검증된 기본 카테고리 팔레트 (slot 1~8, light).
+// 5개 슬롯 조합은 validate_palette.js 전 항목 통과(최악 인접 CVD ΔE 9.1 / 일반시야 19.6).
+// 대비 경고가 걸리는 슬롯이 있어 "표로 보기"를 항상 함께 제공한다(relief rule).
+const SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
+
+const SCHEDULE_VIEWS = [
+  { key: "manpower", label: "인력 소요" },
+  { key: "gate", label: "착수 체크" },
+  { key: "claim", label: "공기연장" },
+];
+
+function ScheduleTab({ schedule, manpower, claim, checklist, onChangeChecklist }) {
+  const [view, setView] = useState("manpower");
+  return (
+    <div>
+      <div className="toggle2">
+        {SCHEDULE_VIEWS.map((v) => (
+          <button key={v.key} className={view === v.key ? "active" : ""} onClick={() => setView(v.key)}>{v.label}</button>
+        ))}
+      </div>
+      {view === "manpower" && <ManpowerCard schedule={schedule} manpower={manpower} />}
+      {view === "gate" && <GateCard schedule={schedule} checklist={checklist} onChange={onChangeChecklist} />}
+      {view === "claim" && <ClaimCard claim={claim} />}
+    </div>
+  );
+}
+
+// ---------- 인력 소요 곡선 ----------
+function ManpowerCard({ schedule, manpower }) {
+  const { series, peak, capacity, avgRecent, shortDays, firstShortDate, dongs, overdue } = manpower;
+  const [showTable, setShowTable] = useState(false);
+  const colorOf = (dong) => SERIES_COLORS[dongs.indexOf(dong) % SERIES_COLORS.length];
+
+  if (!series.length) {
+    return (
+      <div className="card">
+        <h2>인력 소요 곡선</h2>
+        <p className="meta">진행 중인 동이 없습니다. 모든 동이 완료되었거나 기준정보가 비어 있습니다.</p>
+      </div>
+    );
+  }
+
+  const gap = capacity > 0 ? peak.total - capacity : 0;
+
+  return (
+    <>
+      <div className="card">
+        <h2>인력 소요 요약</h2>
+        <div className="statgrid">
+          <div className="stat"><div className="label">피크 필요 인원</div><div className="value">{fmtNum(peak.total, 0)}명</div></div>
+          <div className="stat"><div className="label">피크 시점</div><div className="value" style={{ fontSize: 15 }}>{peak.date}</div></div>
+          <div className="stat"><div className="label">가용 인원(최근 30일 최대)</div><div className="value">{fmtNum(capacity, 0)}명</div></div>
+          <div className="stat"><div className="label">최근 30일 평균 투입</div><div className="value">{fmtNum(avgRecent, 1)}명</div></div>
+        </div>
+        {gap > 0 && (
+          <p className="meta" style={{ marginTop: 10, color: "#d32f2f", fontWeight: 700 }}>
+            🚨 피크에 {fmtNum(gap, 0)}명 부족 · 인원 부족 예상일 {shortDays}일 (최초 {firstShortDate})
+          </p>
+        )}
+        {overdue.length > 0 && (
+          <p className="meta" style={{ marginTop: 6, color: "#d32f2f" }}>
+            ⛔ 조정 완료예정일이 이미 지난 동: {overdue.map((o) => `${o.dong}(${o.end})`).join(", ")}
+          </p>
+        )}
+        <p className="meta" style={{ marginTop: 8 }}>
+          완료된 동은 제외했습니다. 각 동의 잔여 물량을 조정 완료예정일(원 완료예정일 + 착수지연)까지
+          균등 배분하고, 동별 실적 생산성으로 나눠 필요 인원을 낸 값입니다. 일요일은 제외했습니다.
+        </p>
+      </div>
+
+      <div className="card">
+        <h2>날짜별 필요 인원</h2>
+        <ManpowerChart series={series} dongs={dongs} capacity={capacity} colorOf={colorOf} />
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 10 }}>
+          {dongs.map((d) => (
+            <span key={d} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "var(--sub)" }}>
+              <span style={{ width: 10, height: 10, borderRadius: 3, background: colorOf(d) }} />
+              {d}
+            </span>
+          ))}
+          {capacity > 0 && (
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "var(--sub)" }}>
+              <span style={{ width: 14, height: 0, borderTop: "2px dashed #52514e" }} />
+              가용 {fmtNum(capacity, 0)}명
+            </span>
+          )}
+        </div>
+        <button
+          onClick={() => setShowTable((v) => !v)}
+          style={{ marginTop: 12, border: "1px solid var(--line)", background: "none", borderRadius: 8, padding: "6px 10px", fontSize: 12, color: "var(--sub)" }}
+        >
+          {showTable ? "표 닫기" : "표로 보기"}
+        </button>
+        {showTable && (
+          <div style={{ overflowX: "auto", marginTop: 10 }}>
+            <table className="dashtable">
+              <thead>
+                <tr><th>날짜</th>{dongs.map((d) => <th key={d}>{d}</th>)}<th>합계</th></tr>
+              </thead>
+              <tbody>
+                {series.map((s) => (
+                  <tr key={s.date}>
+                    <td className="dong" style={{ whiteSpace: "nowrap" }}>{s.date.slice(5)}</td>
+                    {dongs.map((d) => <td key={d}>{s.byDong[d] ? fmtNum(s.byDong[d], 1) : "-"}</td>)}
+                    <td style={{ fontWeight: 700, color: capacity > 0 && s.total > capacity ? "#d32f2f" : "inherit" }}>{fmtNum(s.total, 1)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>동별 잔여 · 공기</h2>
+        <div style={{ overflowX: "auto" }}>
+          <table className="dashtable">
+            <thead>
+              <tr><th>동</th><th>잔여(m²)</th><th>착수지연</th><th>원 완료예정</th><th>조정 완료예정</th><th>생산성</th></tr>
+            </thead>
+            <tbody>
+              {schedule.map((r) => (
+                <tr key={r.dong} style={{ opacity: r.done ? 0.45 : 1 }}>
+                  <td className="dong">{r.dong}{r.done && <span style={{ fontSize: 10, color: "var(--sub)" }}> 완료</span>}</td>
+                  <td>{r.done ? "0" : fmtNum(r.remain, 0)}</td>
+                  <td style={{ color: r.startDelay > 0 ? "#d32f2f" : "inherit", whiteSpace: "nowrap" }}>
+                    {r.startDelay > 0 ? `${r.startDelay}일` : "-"}
+                    {r.startBasis === "not-started" && <span style={{ fontSize: 10, display: "block" }}>미착수</span>}
+                  </td>
+                  <td style={{ whiteSpace: "nowrap" }}>{r.plannedEnd || "-"}</td>
+                  <td style={{ whiteSpace: "nowrap", fontWeight: r.startDelay > 0 ? 700 : 400 }}>{r.adjustedEnd || "-"}</td>
+                  <td>{fmtNum(r.productivity, 1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="meta" style={{ marginTop: 8 }}>
+          생산성은 동 단위 누적 평균입니다. 벽체 판재는 많이 나오고 창대석·창주위석·두겁석이나 첫날은 적게 나오므로,
+          하루 단위로 보면 편차가 크지만 동을 끝내면 평균으로 수렴합니다. 그래서 일자별 생산성으로는 판정하지 않습니다.
+        </p>
+      </div>
+    </>
+  );
+}
+
+// 누적 막대 + 가용 인원 기준선
+function ManpowerChart({ series, dongs, capacity, colorOf }) {
+  const [hover, setHover] = useState(null);
+  const W = 320, H = 190, padL = 26, padR = 6, padT = 10, padB = 34;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxVal = Math.max(capacity, ...series.map((s) => s.total)) * 1.12 || 1;
+  const bw = Math.max(2, Math.min(18, plotW / series.length - 2));
+  const x = (i) => padL + (plotW / series.length) * (i + 0.5) - bw / 2;
+  const y = (v) => padT + plotH - (v / maxVal) * plotH;
+  const ticks = [0, maxVal / 2, maxVal].map((v) => Math.round(v));
+
+  return (
+    <div style={{ position: "relative" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }} role="img" aria-label="날짜별 필요 인원 누적 막대 차트">
+        {ticks.map((t) => (
+          <g key={t}>
+            <line x1={padL} x2={W - padR} y1={y(t)} y2={y(t)} stroke="#e5e7eb" strokeWidth="1" />
+            <text x={padL - 4} y={y(t) + 3} textAnchor="end" fontSize="8" fill="#8b8b86">{t}</text>
+          </g>
+        ))}
+        {series.map((s, i) => {
+          let acc = 0;
+          return (
+            <g key={s.date} onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}>
+              <rect x={x(i) - 1} y={padT} width={bw + 2} height={plotH} fill="transparent" />
+              {dongs.map((d) => {
+                const v = s.byDong[d];
+                if (!v) return null;
+                const h = (v / maxVal) * plotH;
+                const yy = padT + plotH - acc - h;
+                acc += h;
+                return <rect key={d} x={x(i)} y={yy} width={bw} height={Math.max(0, h - 2)} fill={colorOf(d)} rx="1.5" />;
+              })}
+            </g>
+          );
+        })}
+        {capacity > 0 && (
+          <>
+            <line x1={padL} x2={W - padR} y1={y(capacity)} y2={y(capacity)} stroke="#52514e" strokeWidth="2" strokeDasharray="5 3" />
+            <text x={W - padR} y={y(capacity) - 4} textAnchor="end" fontSize="8.5" fill="#52514e" fontWeight="700">가용 {Math.round(capacity)}명</text>
+          </>
+        )}
+        {series.map((s, i) =>
+          i % Math.ceil(series.length / 6) === 0 ? (
+            <text key={s.date} x={x(i) + bw / 2} y={H - padB + 12} textAnchor="middle" fontSize="8" fill="#8b8b86">{s.date.slice(5)}</text>
+          ) : null
+        )}
+        <line x1={padL} x2={W - padR} y1={padT + plotH} y2={padT + plotH} stroke="#d1d5db" strokeWidth="1" />
+      </svg>
+      {hover !== null && series[hover] && (
+        <div style={{ position: "absolute", top: 4, left: "50%", transform: "translateX(-50%)", background: "#111", color: "#fff", borderRadius: 8, padding: "6px 9px", fontSize: 11, lineHeight: 1.5, pointerEvents: "none", whiteSpace: "nowrap", zIndex: 5 }}>
+          <b>{series[hover].date}</b> · 합계 {fmtNum(series[hover].total, 1)}명
+          {dongs.filter((d) => series[hover].byDong[d]).map((d) => (
+            <div key={d}>{d} {fmtNum(series[hover].byDong[d], 1)}명</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- 착수 선행공정 체크리스트 ----------
+function GateCard({ schedule, checklist, onChange }) {
+  const map = new Map((checklist || []).map((c) => [c.dong, c]));
+  const rowOf = (dong) => map.get(dong) || { dong, gates: {}, done: false, reason: "" };
+
+  function update(dong, patch) {
+    const cur = rowOf(dong);
+    const next = { ...cur, ...patch, gates: { ...cur.gates, ...(patch.gates || {}) } };
+    const list = (checklist || []).filter((c) => c.dong !== dong);
+    onChange([...list, next].sort((a, b) => String(a.dong).localeCompare(String(b.dong), "ko")));
+  }
+
+  return (
+    <>
+      <div className="card">
+        <h2>착수 선행공정 체크</h2>
+        <p className="meta">
+          동당 한 번만 체크하면 됩니다. 매일 입력하는 항목이 아닙니다.
+          지연사유에 적은 내용은 그대로 공기연장 근거로 넘어갑니다.
+        </p>
+      </div>
+      {[...schedule].sort((a, b) => (a.done === b.done ? 0 : a.done ? 1 : -1)).map((r) => {
+        const row = rowOf(r.dong);
+        const missing = GATE_KEYS.filter((k) => !row.gates?.[k]);
+        return (
+          <div className="card" key={r.dong} style={{ opacity: r.done ? 0.5 : 1 }}>
+            <h2 style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>
+                {r.dong}
+                {r.done && <span style={{ fontSize: 11, color: "var(--sub)", fontWeight: 400 }}> · 완료</span>}
+                {!r.done && r.startDelay > 0 && (
+                  <span style={{ fontSize: 11, color: "#d32f2f", fontWeight: 700 }}> · 착수 {r.startDelay}일 지연</span>
+                )}
+              </span>
+              <label style={{ fontSize: 11.5, fontWeight: 400, color: "var(--sub)", display: "inline-flex", alignItems: "center", gap: 4 }}>
+                <input type="checkbox" checked={!!row.done} onChange={(e) => update(r.dong, { done: e.target.checked })} />
+                완료 처리
+              </label>
+            </h2>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+              {GATE_KEYS.map((k) => (
+                <label key={k} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12, border: "1px solid var(--line)", borderRadius: 8, padding: "5px 8px", background: row.gates?.[k] ? "#eef7ee" : "none" }}>
+                  <input type="checkbox" checked={!!row.gates?.[k]} onChange={(e) => update(r.dong, { gates: { [k]: e.target.checked } })} />
+                  {GATE_LABELS[k]}
+                </label>
+              ))}
+            </div>
+            {!r.done && !r.actualStart && missing.length > 0 && (
+              <p className="meta" style={{ color: "#e8a700", marginBottom: 6 }}>
+                미충족: {missing.map((k) => GATE_LABELS[k]).join(", ")}
+              </p>
+            )}
+            <Field label="지연사유 (어떤 선행공정 때문인지)">
+              <input
+                type="text"
+                value={row.reason || ""}
+                placeholder="예: 비계 해체 지연 / 창호 취부 미완료"
+                onChange={(e) => update(r.dong, { reason: e.target.value })}
+              />
+            </Field>
+            <p className="meta" style={{ marginTop: 6 }}>
+              계획착수 {r.plannedStart || "-"} → 실제착수 {r.actualStart || "미착수"} ·
+              완료예정 {r.plannedEnd || "-"} → <b>{r.adjustedEnd || "-"}</b>
+            </p>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+// ---------- 공기연장 클레임 집계 ----------
+function ClaimCard({ claim }) {
+  const [showAll, setShowAll] = useState(false);
+  const ev = showAll ? claim.evidence : claim.evidence.slice(0, 20);
+  return (
+    <>
+      <div className="card">
+        <h2>공기연장 청구 가능일수</h2>
+        <div className="statgrid">
+          <div className="stat"><div className="label">합계</div><div className="value">{fmtNum(claim.totalClaimDays, 1)}일</div></div>
+          <div className="stat"><div className="label">착수지연</div><div className="value">{fmtNum(claim.totalStartDelay, 0)}일</div></div>
+          <div className="stat"><div className="label">천재지변·부분영향 손실</div><div className="value">{fmtNum(claim.totalLoss, 1)}일</div></div>
+          <div className="stat"><div className="label">정상 조업일</div><div className="value">{claim.counts.N} / {claim.totalRows}일</div></div>
+        </div>
+        <p className="meta" style={{ marginTop: 10 }}>
+          천재지변(Y) {claim.counts.Y}건은 1일로, 부분영향(P) {claim.counts.P}건은 그날 실적이
+          정상 생산성 대비 몇 %였는지로 손실일을 자동 산정했습니다.
+          (예: 정상의 40%만 했으면 0.6일 손실)
+        </p>
+        <p className="meta" style={{ marginTop: 6 }}>
+          완료된 동의 과거 손실도 포함합니다. 이미 발생한 청구 근거이기 때문입니다.
+        </p>
+      </div>
+
+      <div className="card">
+        <h2>동별</h2>
+        <div style={{ overflowX: "auto" }}>
+          <table className="dashtable">
+            <thead><tr><th>동</th><th>착수지연</th><th>손실일</th><th>합계</th><th>지연사유</th></tr></thead>
+            <tbody>
+              {claim.byDong.map((d) => (
+                <tr key={d.dong} style={{ opacity: d.done ? 0.55 : 1 }}>
+                  <td className="dong">{d.dong}{d.done && <span style={{ fontSize: 10, color: "var(--sub)" }}> 완료</span>}</td>
+                  <td>{d.startDelay ? `${d.startDelay}일` : "-"}</td>
+                  <td>{fmtNum(d.lossAfter, 1)}일</td>
+                  <td style={{ fontWeight: 700 }}>{fmtNum(d.claimDays, 1)}일</td>
+                  <td style={{ fontSize: 11, textAlign: "left" }}>{d.delayReason || "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>월별</h2>
+        <table className="dashtable">
+          <thead><tr><th>월</th><th>손실일</th><th>천재지변</th><th>부분영향</th><th>해당일수</th></tr></thead>
+          <tbody>
+            {claim.months.map((m) => (
+              <tr key={m.month}>
+                <td className="dong">{m.month}</td>
+                <td style={{ fontWeight: 700 }}>{fmtNum(m.loss, 1)}일</td>
+                <td>{m.y}건</td>
+                <td>{m.p}건</td>
+                <td>{m.days}일</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <h2>근거 리스트 ({claim.evidence.length}건)</h2>
+        <div style={{ overflowX: "auto" }}>
+          <table className="dashtable">
+            <thead><tr><th>날짜</th><th>동</th><th>구분</th><th>손실</th><th>인원</th><th>실적</th><th>사유</th></tr></thead>
+            <tbody>
+              {ev.map((e, i) => (
+                <tr key={`${e.date}-${e.dong}-${i}`}>
+                  <td style={{ whiteSpace: "nowrap" }}>{e.date.slice(5)}</td>
+                  <td className="dong">{e.dong}{e.inherited && <span title="직전 작업동에서 자동 지정" style={{ fontSize: 9, color: "var(--sub)" }}> 자동</span>}</td>
+                  <td>{e.kind}</td>
+                  <td style={{ fontWeight: 700 }}>{e.loss.toFixed(2)}</td>
+                  <td>{e.workers}</td>
+                  <td>{fmtNum(e.actual, 1)}</td>
+                  <td style={{ fontSize: 10.5, textAlign: "left" }}>{[e.reason, e.note].filter(Boolean).join(" / ") || "-"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {claim.evidence.length > 20 && (
+          <button onClick={() => setShowAll((v) => !v)} style={{ marginTop: 10, border: "1px solid var(--line)", background: "none", borderRadius: 8, padding: "6px 10px", fontSize: 12, color: "var(--sub)" }}>
+            {showAll ? "접기" : `전체 ${claim.evidence.length}건 보기`}
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -490,11 +900,19 @@ function AreaInputCard({ scope, form, setForm, onSave, dongList, fields }) {
         <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} />
       </Field>
       <Field label="해당 동(구역)">
+        {/* 비 오는 날처럼 조업을 못 한 날은 동을 고르지 않아도 됩니다.
+            빈 값으로 두면 직전에 작업하던 동이 자동으로 적용됩니다. */}
         <select value={form.dong} onChange={(e) => setForm({ ...form, dong: e.target.value })}>
+          <option value="">(자동) 직전 작업 동 — 천재지변·조업불가일용</option>
           {dongList.length === 0 && <option value="">(기준정보 없음 — 동기화 필요)</option>}
           {dongList.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
       </Field>
+      {!form.dong && (
+        <p className="meta" style={{ marginTop: -4, marginBottom: 10 }}>
+          동을 비워두면 직전에 작업하던 동이 자동으로 적용됩니다. 공기연장 집계에도 그 동으로 잡힙니다.
+        </p>
+      )}
       {pairRows(workerFields).map((pair, ri) => (
         <div className="row" key={ri}>
           {pair.map((f) => (

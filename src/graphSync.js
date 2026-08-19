@@ -851,6 +851,101 @@ export function readOrderStatus(wb) {
   return best;
 }
 
+// ===== ⑦착수체크리스트 시트 =====
+// 동별 "착수 선행공정" 게이트를 기록하는 시트. 앱이 없으면 자동으로 만듭니다.
+// 매일 입력하는 게 아니라 동당 한 번만 손대는 표라서 일일 입력 부담이 늘지 않습니다.
+// 지연사유(비고)에 적은 내용이 그대로 공기연장 근거 리스트에 실립니다.
+
+export const SHEET_CHECKLIST = "⑦착수체크리스트";
+
+// 선행공정 게이트 항목 (열 순서 = 이 순서)
+export const GATE_ITEMS = [
+  { key: "scaffold", label: "비계 설치" },
+  { key: "window", label: "창호 취부" },
+  { key: "frame", label: "골조·먹매김" },
+  { key: "material", label: "자재 반입" },
+  { key: "shopdwg", label: "샵도면 승인" },
+];
+
+const CHECKLIST_HEADERS = [
+  "동(구역)",
+  ...GATE_ITEMS.map((g) => g.label),
+  "완료",
+  "지연사유(선행공정)",
+];
+
+function truthy(v) {
+  const s = String(v ?? "").trim().toUpperCase();
+  return s === "Y" || s === "O" || s === "TRUE" || s === "1" || s === "V" || s === "✓";
+}
+
+// 헤더 라벨로 열을 찾아 매핑 (사용자가 열을 옮겨도 따라감)
+function mapChecklistCols(ws) {
+  const map = {};
+  for (let c = 1; c <= 20; c++) {
+    const raw = rawCell(ws, `${colLetter(c)}1`);
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const norm = raw.replace(/\s/g, "");
+    if (map.dong === undefined && norm.includes("동")) map.dong = colLetter(c);
+    for (const g of GATE_ITEMS) {
+      const gl = g.label.replace(/[\s·]/g, "");
+      if (map[g.key] === undefined && norm.replace(/·/g, "").includes(gl.slice(0, 2))) map[g.key] = colLetter(c);
+    }
+    if (map.done === undefined && norm === "완료") map.done = colLetter(c);
+    if (map.reason === undefined && norm.includes("지연사유")) map.reason = colLetter(c);
+  }
+  return map;
+}
+
+export function readChecklist(wb) {
+  const ws = wb.getWorksheet(SHEET_CHECKLIST);
+  if (!ws) return [];
+  const cols = mapChecklistCols(ws);
+  if (!cols.dong) return [];
+  const out = [];
+  const maxRow = Math.min(ws.rowCount || 1, 300);
+  for (let r = 2; r <= maxRow; r++) {
+    const dong = rawCell(ws, `${cols.dong}${r}`);
+    if (dong === null || String(dong).trim() === "") continue;
+    const row = { dong: String(dong).trim(), gates: {} };
+    for (const g of GATE_ITEMS) row.gates[g.key] = cols[g.key] ? truthy(rawCell(ws, `${cols[g.key]}${r}`)) : false;
+    row.done = cols.done ? truthy(rawCell(ws, `${cols.done}${r}`)) : false;
+    row.reason = cols.reason ? String(rawCell(ws, `${cols.reason}${r}`) ?? "") : "";
+    out.push(row);
+  }
+  return out;
+}
+
+// 체크리스트 전체를 시트에 다시 씀 (시트가 없으면 생성).
+// 값만 쓰므로 사용자가 시트에 서식을 입혀두면 그대로 유지됩니다.
+export function writeChecklist(wb, rows) {
+  let ws = wb.getWorksheet(SHEET_CHECKLIST);
+  if (!ws) {
+    ws = wb.addWorksheet(SHEET_CHECKLIST);
+    ws.getColumn(1).width = 14;
+    for (let i = 2; i <= CHECKLIST_HEADERS.length; i++) ws.getColumn(i).width = i === CHECKLIST_HEADERS.length ? 40 : 12;
+  }
+  CHECKLIST_HEADERS.forEach((h, i) => {
+    const cell = ws.getCell(`${colLetter(i + 1)}1`);
+    cell.value = h;
+    cell.font = { bold: true };
+  });
+  // 기존 데이터 행 비우기 (동 목록이 줄어든 경우 잔여물 제거)
+  const maxRow = Math.min(ws.rowCount || 1, 300);
+  for (let r = 2; r <= maxRow; r++) {
+    for (let c = 1; c <= CHECKLIST_HEADERS.length; c++) ws.getCell(`${colLetter(c)}${r}`).value = null;
+  }
+  rows.forEach((row, i) => {
+    const r = i + 2;
+    let c = 1;
+    ws.getCell(`${colLetter(c++)}${r}`).value = row.dong;
+    for (const g of GATE_ITEMS) ws.getCell(`${colLetter(c++)}${r}`).value = row.gates?.[g.key] ? "Y" : "";
+    ws.getCell(`${colLetter(c)}${r}`).value = row.done ? "Y" : "";
+    ws.getCell(`${colLetter(c + 1)}${r}`).value = row.reason || "";
+  });
+  return ws;
+}
+
 // 전체 흐름: 로그인 → 다운로드 → 파싱 → 앱 상태 반환 (워크북 객체도 함께 보관해야 재업로드 가능)
 // site: { id, name, filePath, fileName } — 어떤 현장의 OneDrive 파일을 동기화할지 지정
 export async function syncDown(site) {
@@ -865,7 +960,8 @@ export async function syncDown(site) {
   const thresholds = readThresholds(wb);
   const achvExternal = readAchievement(wb, SHEET_ACHV_EXTERNAL);
   const achvInternal = readAchievement(wb, SHEET_ACHV_INTERNAL);
-  return { wb, itemId, buildings, logsExternal, logsInternal, orderRows, thresholds, achvExternal, achvInternal, syncedAt: new Date().toISOString() };
+  const checklist = readChecklist(wb);
+  return { wb, itemId, buildings, logsExternal, logsInternal, orderRows, thresholds, achvExternal, achvInternal, checklist, syncedAt: new Date().toISOString() };
 }
 
 export async function syncUp(wb, itemId) {

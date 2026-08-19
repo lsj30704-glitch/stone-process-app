@@ -337,3 +337,376 @@ export function calcOrderStatus(rows) {
   });
   return { byDong, grand, dongCount: byDong.length };
 }
+
+// ============================================================================
+// 공기(工期) 관리 — 착수지연 / 천재지변 손실 / 인력 소요 곡선 / 공기연장 클레임
+// ============================================================================
+//
+// [설계 전제 — 사용자 확정 사항]
+//  1. 부분영향(P)은 실적 기반으로 손실일을 자동 산정한다.
+//     그날 실적이 "정상 생산성 × 투입인원"의 몇 %인지 보고 모자란 만큼을 손실로 친다.
+//  2. 천재지변(Y)은 조업 불가이므로 1.0일 고정.
+//  3. 천재지변 행에 동을 적지 않으면, 직전 조업일에 작업하던 동을 그대로 물려받는다.
+//     (비 오는 날 동까지 고르지 않아도 되게)
+//  4. 착수 지연 = 계획착수일 → 첫 실적일. 아직 착수 못 한 동은 오늘까지로 계속 늘어난다.
+//     이 지연일수만큼 완료예정일이 뒤로 밀린다.
+//  5. 완료된 동(누적 ≥ 계획, 또는 체크리스트에서 수동 완료)은 앞으로 시공량이 0이므로
+//     인력 소요 곡선과 잔여 계산에서 완전히 제외한다.
+//
+// [생산성에 대한 주의]
+//  인당 생산성 편차가 큰 것은 정상이다. 벽체 판재는 많이 나오고, 창대석·창주위석 같은
+//  작은 돌, 상부 두겁석, 그리고 작업 첫날은 적게 나온다. 한 동을 끝내면 이 조합이 섞여
+//  동 단위 평균으로 수렴하므로, 생산성은 항상 "동 단위 누적 평균"으로만 쓴다.
+//  개별 일자 생산성으로 이상치 경고 같은 것을 띄우지 않는다.
+
+const DAY_MS = 86400000;
+
+export function toDate(v) {
+  if (v instanceof Date) return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+  if (!v) return null;
+  const d = new Date(`${String(v).slice(0, 10)}T00:00:00`);
+  return isNaN(d) ? null : d;
+}
+export function isoOf(d) {
+  if (!d) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+function addDays(d, n) {
+  return new Date(d.getTime() + n * DAY_MS);
+}
+function diffDays(a, b) {
+  return Math.round((toDate(b) - toDate(a)) / DAY_MS);
+}
+// 일요일만 휴무로 본다 (현장 관행: 토요일 조업)
+function isWorkday(d) {
+  return d.getDay() !== 0;
+}
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+function workersOf(l) {
+  return (Number(l.masonry) || 0) + (Number(l.caulking) || 0) + (Number(l.truss) || 0) + (Number(l.scaffold) || 0);
+}
+function disasterKind(l) {
+  const s = String(l?.disaster ?? "").trim().toUpperCase();
+  if (s.startsWith("Y")) return "Y";
+  if (s.startsWith("P")) return "P";
+  if (s.startsWith("N")) return "N";
+  return "";
+}
+
+// ---------- 1) 천재지변 행의 동 상속 ----------
+// 동이 비어 있는 행에, 직전 "실적이 발생한 날"에 작업하던 동 목록을 물려준다.
+// 반환: 원본 로그에 dongs[] (실제 적용 대상 동 배열)를 붙인 새 배열.
+export function expandLogDongs(logs) {
+  const rows = (logs || []).map((l) => ({ ...l, _d: toDate(l.date) })).filter((l) => l._d);
+  rows.sort((a, b) => a._d - b._d || (a.row || 0) - (b.row || 0));
+
+  const byDate = new Map();
+  for (const r of rows) {
+    const k = isoOf(r._d);
+    if (!byDate.has(k)) byDate.set(k, []);
+    byDate.get(k).push(r);
+  }
+
+  let lastActive = [];
+  for (const k of [...byDate.keys()].sort()) {
+    const group = byDate.get(k);
+    for (const r of group) {
+      const dong = String(r.dong ?? "").trim();
+      r.dongs = dong ? [dong] : [...lastActive];
+      r.inherited = !dong && r.dongs.length > 0;
+    }
+    // 그날 실제로 시공이 있었던 동만 "직전 작업동"으로 기억
+    const worked = [...new Set(group.filter((r) => Number(r.actual) > 0).flatMap((r) => r.dongs))];
+    if (worked.length) lastActive = worked;
+  }
+  return rows;
+}
+
+// ---------- 2) 동별 정상 생산성 (손실일 산정 기준) ----------
+// 정상(N)일의 인당 시공량을 동별로 낸다. 그 동에 정상일이 없으면 전체 정상일 평균,
+// 그것도 없으면 그 동의 전체 평균, 마지막으로 기준정보의 1인당 일일시공량을 쓴다.
+export function normalProductivity(logs, th = THRESHOLDS) {
+  const perDong = {};
+  let gAct = 0, gPpl = 0;
+  const anyDong = {};
+  for (const l of logs || []) {
+    const act = Number(l.actual) || 0;
+    const ppl = workersOf(l);
+    if (act <= 0 || ppl <= 0) continue;
+    const dongs = l.dongs?.length ? l.dongs : (l.dong ? [l.dong] : []);
+    for (const d of dongs) {
+      anyDong[d] = anyDong[d] || { act: 0, ppl: 0 };
+      anyDong[d].act += act / dongs.length;
+      anyDong[d].ppl += ppl / dongs.length;
+      if (disasterKind(l) === "N") {
+        perDong[d] = perDong[d] || { act: 0, ppl: 0 };
+        perDong[d].act += act / dongs.length;
+        perDong[d].ppl += ppl / dongs.length;
+        gAct += act / dongs.length;
+        gPpl += ppl / dongs.length;
+      }
+    }
+  }
+  const globalNormal = gPpl > 0 ? gAct / gPpl : null;
+  const base = th?.productivityPerWorker || 10;
+  const get = (dong) => {
+    const p = perDong[dong];
+    if (p && p.ppl > 0) return { value: p.act / p.ppl, source: "dong-normal" };
+    if (globalNormal) return { value: globalNormal, source: "global-normal" };
+    const a = anyDong[dong];
+    if (a && a.ppl > 0) return { value: a.act / a.ppl, source: "dong-all" };
+    return { value: base, source: "base" };
+  };
+  return { get, globalNormal, base };
+}
+
+// ---------- 3) 일자별 공기 손실 산정 ----------
+// Y = 1.0일, N = 0, P = 1 - (실적 / (인원 × 정상생산성)) 을 0~1로 자른 값.
+// 인원이 0인 날(아예 못 나온 날)은 1.0일.
+export function calcDayLoss(log, normProd) {
+  const kind = disasterKind(log);
+  if (kind === "Y") return 1;
+  if (kind !== "P") return 0;
+  const ppl = workersOf(log);
+  if (ppl <= 0) return 1;
+  const expected = ppl * (normProd || 10);
+  if (expected <= 0) return 0;
+  const ratio = (Number(log.actual) || 0) / expected;
+  return clamp(1 - ratio, 0, 1);
+}
+
+// ---------- 4) 동별 공기 현황 ----------
+// buildings: [{dong, totalArea, startDate, endDate, baseWorkers, ...}]
+// checklist: [{dong, gates:{}, done, reason}]
+export function calcScheduleStatus(buildings, logs, checklist = [], th = THRESHOLDS, today = new Date()) {
+  const T = toDate(today);
+  const rows = expandLogDongs(logs);
+  const np = normalProductivity(rows, th);
+  const cl = new Map((checklist || []).map((c) => [c.dong, c]));
+
+  const acc = {};
+  const ensure = (d) => (acc[d] = acc[d] || { act: 0, ppl: 0, first: null, firstSeen: null, last: null, lossBefore: 0, lossAfter: 0, lossRows: [] });
+
+  // 1차: 동별 첫 실적일(first)과 첫 등장일(firstSeen).
+  // firstSeen은 실적이 0이어도 그 동에 인원이 배치돼 로그에 처음 잡힌 날 = 실질 착수일.
+  for (const l of rows) {
+    for (const d of l.dongs || []) {
+      const a = ensure(d);
+      if (!a.firstSeen || l._d < a.firstSeen) a.firstSeen = l._d;
+    }
+    const act = Number(l.actual) || 0;
+    if (act <= 0) continue;
+    for (const d of l.dongs || []) {
+      const a = ensure(d);
+      if (!a.first || l._d < a.first) a.first = l._d;
+      if (!a.last || l._d > a.last) a.last = l._d;
+      a.act += act / (l.dongs.length || 1);
+      a.ppl += workersOf(l) / (l.dongs.length || 1);
+    }
+  }
+  // 2차: 손실일. 경계는 firstSeen(실질 착수일).
+  // 착수지연도 firstSeen까지만 세므로 두 값이 겹치지 않는다 → 이중계산 없음.
+  for (const l of rows) {
+    const loss = calcDayLoss(l, np.get((l.dongs || [])[0] || "").value);
+    if (loss <= 0) continue;
+    for (const d of l.dongs || []) {
+      const a = ensure(d);
+      const share = loss / (l.dongs.length || 1);
+      if (a.firstSeen && l._d >= a.firstSeen) a.lossAfter += share;
+      else a.lossBefore += share;
+      a.lossRows.push({
+        date: isoOf(l._d), dong: d, loss: share, kind: disasterKind(l),
+        reason: l.reason || "", note: l.note || "", memo: l.memo || "",
+        workers: workersOf(l), actual: Number(l.actual) || 0, inherited: !!l.inherited,
+      });
+    }
+  }
+
+  return (buildings || []).map((b) => {
+    const a = acc[b.dong] || ensure(b.dong);
+    const plan = Number(b.totalArea) || 0;
+    const cum = a.act;
+    const remain = Math.max(0, plan - cum);
+    const manualDone = !!cl.get(b.dong)?.done;
+    const autoDone = plan > 0 && cum >= plan;
+    const done = manualDone || autoDone;
+
+    const plannedStart = toDate(b.startDate);
+    const plannedEnd = toDate(b.endDate);
+    // 착수 지연: 계획착수일 → 첫 실적일. 미착수면 오늘까지(계속 늘어남).
+    // 기준일 = 첫 실적일과 첫 등장일 중 빠른 쪽. 실적이 아직 없어도 인원이 들어간 날이
+    // 있으면 그날 착수한 것으로 본다(그 뒤는 손실일로 잡히므로 중복되지 않는다).
+    let startDelay = 0;
+    let startBasis = "on-time";
+    const actualStart = a.first && a.firstSeen ? (a.first < a.firstSeen ? a.first : a.firstSeen) : (a.first || a.firstSeen);
+    if (plannedStart && !done) {
+      if (actualStart) {
+        startDelay = Math.max(0, diffDays(plannedStart, actualStart));
+        startBasis = startDelay > 0 ? "late-start" : "on-time";
+      } else if (T > plannedStart) {
+        startDelay = diffDays(plannedStart, T);
+        startBasis = "not-started";
+      }
+    }
+    const adjustedEnd = plannedEnd ? addDays(plannedEnd, startDelay) : null;
+    const prod = np.get(b.dong);
+
+    const gate = cl.get(b.dong);
+    const gatesOk = gate ? GATE_KEYS.every((k) => gate.gates?.[k]) : false;
+    const gatesMissing = gate ? GATE_KEYS.filter((k) => !gate.gates?.[k]) : GATE_KEYS.slice();
+
+    return {
+      dong: b.dong,
+      planArea: plan,
+      cumActual: cum,
+      remain: done ? 0 : remain,
+      done, doneBy: manualDone ? "manual" : autoDone ? "auto" : null,
+      plannedStart: isoOf(plannedStart),
+      plannedEnd: isoOf(plannedEnd),
+      adjustedEnd: isoOf(adjustedEnd),
+      firstActual: isoOf(a.first),
+      firstSeen: isoOf(a.firstSeen),
+      actualStart: isoOf(actualStart),
+      lastActual: isoOf(a.last),
+      startDelay, startBasis,
+      lossAfter: a.lossAfter, lossBefore: a.lossBefore,
+      lossRows: a.lossRows,
+      productivity: prod.value, productivitySource: prod.source,
+      baseWorkers: Number(b.baseWorkers) || 0,
+      gate: gate || null, gatesOk, gatesMissing,
+      delayReason: gate?.reason || "",
+    };
+  });
+}
+
+export const GATE_KEYS = ["scaffold", "window", "frame", "material", "shopdwg"];
+export const GATE_LABELS = {
+  scaffold: "비계 설치",
+  window: "창호 취부",
+  frame: "골조·먹매김",
+  material: "자재 반입",
+  shopdwg: "샵도면 승인",
+};
+
+// ---------- 5) 인력 소요 곡선 ----------
+// 완료된 동은 앞으로 시공량이 0이므로 제외한다.
+// 남은 동만, 조정 완료예정일(= 원 완료예정일 + 착수지연)까지 균등 배분해서
+// 날짜별 필요 인원을 쌓아 올린다. 일요일은 제외.
+export function calcManpowerCurve(scheduleRows, logs, today = new Date(), horizonDays = 120) {
+  const T = toDate(today);
+  const perDate = new Map(); // iso → { total, byDong: {dong: n} }
+  const add = (d, dong, n) => {
+    const k = isoOf(d);
+    if (!perDate.has(k)) perDate.set(k, { date: k, total: 0, byDong: {} });
+    const e = perDate.get(k);
+    e.total += n;
+    e.byDong[dong] = (e.byDong[dong] || 0) + n;
+  };
+
+  const active = (scheduleRows || []).filter((r) => !r.done && r.remain > 0);
+  const overdue = [];
+
+  for (const r of active) {
+    const end = toDate(r.adjustedEnd) || toDate(r.plannedEnd);
+    const plannedStart = toDate(r.plannedStart);
+    const start = plannedStart && plannedStart > T ? plannedStart : T;
+    const prod = r.productivity > 0 ? r.productivity : 10;
+
+    const days = [];
+    if (end) {
+      for (let d = new Date(start); d <= end && days.length < horizonDays; d = addDays(d, 1)) {
+        if (isWorkday(d)) days.push(new Date(d));
+      }
+    }
+    if (!days.length) {
+      // 조정 완료예정일이 이미 지났거나 산출 불가 → 공기 초과. 오늘 하루에 몰아 표시.
+      overdue.push({ dong: r.dong, remain: r.remain, end: r.adjustedEnd || r.plannedEnd });
+      if (isWorkday(T)) add(T, r.dong, r.remain / prod);
+      continue;
+    }
+    const perDay = r.remain / days.length / prod;
+    for (const d of days) add(d, r.dong, perDay);
+  }
+
+  const series = [...perDate.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
+  const peak = series.reduce((m, s) => (s.total > m.total ? s : m), { total: 0, date: "" });
+
+  // 가용 인원 기준선: 최근 30일 실투입 중 최대값 (없으면 0)
+  const recent = (logs || [])
+    .map((l) => ({ d: toDate(l.date), w: workersOf(l) }))
+    .filter((x) => x.d && diffDays(x.d, T) <= 30 && diffDays(x.d, T) >= 0);
+  const byDay = new Map();
+  for (const x of recent) {
+    const k = isoOf(x.d);
+    byDay.set(k, (byDay.get(k) || 0) + x.w);
+  }
+  const capacity = byDay.size ? Math.max(...byDay.values()) : 0;
+  const avgRecent = byDay.size ? [...byDay.values()].reduce((a, b) => a + b, 0) / byDay.size : 0;
+
+  const shortDays = series.filter((s) => capacity > 0 && s.total > capacity);
+
+  return {
+    series, peak, capacity, avgRecent, overdue,
+    dongs: active.map((r) => r.dong),
+    shortDays: shortDays.length,
+    firstShortDate: shortDays[0]?.date || "",
+  };
+}
+
+// ---------- 6) 공기연장 클레임 집계 ----------
+// 이미 발생한 손실이므로 완료된 동의 과거 손실도 포함한다(청구 근거이기 때문).
+// 다만 착수 전 손실(lossBefore)은 착수지연에 이미 반영돼 있으므로 별도로 구분해 표시한다.
+export function calcClaimSummary(scheduleRows, logs) {
+  const rows = expandLogDongs(logs);
+  const all = [];
+  for (const r of scheduleRows || []) all.push(...r.lossRows);
+
+  const byDong = (scheduleRows || []).map((r) => ({
+    dong: r.dong,
+    startDelay: r.startDelay,
+    delayReason: r.delayReason,
+    lossAfter: r.lossAfter,
+    lossBefore: r.lossBefore,
+    claimDays: r.startDelay + r.lossAfter,
+    done: r.done,
+    plannedEnd: r.plannedEnd,
+    adjustedEnd: r.adjustedEnd,
+  })).sort((a, b) => b.claimDays - a.claimDays);
+
+  const byMonth = {};
+  for (const l of all) {
+    const m = l.date.slice(0, 7);
+    if (!byMonth[m]) byMonth[m] = { month: m, loss: 0, y: 0, p: 0, days: new Set() };
+    byMonth[m].loss += l.loss;
+    if (l.kind === "Y") byMonth[m].y += 1;
+    if (l.kind === "P") byMonth[m].p += 1;
+    byMonth[m].days.add(l.date);
+  }
+  const months = Object.values(byMonth)
+    .map((m) => ({ ...m, days: m.days.size }))
+    .sort((a, b) => (a.month < b.month ? -1 : 1));
+
+  const counts = { Y: 0, P: 0, N: 0 };
+  for (const l of rows) {
+    const k = disasterKind(l);
+    if (counts[k] !== undefined) counts[k] += 1;
+  }
+
+  const totalStartDelay = byDong.reduce((s, d) => s + d.startDelay, 0);
+  const totalLoss = byDong.reduce((s, d) => s + d.lossAfter, 0);
+
+  // 근거 리스트: 손실이 큰 순 → 날짜 순
+  const evidence = all
+    .filter((l) => l.loss > 0.01)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : b.loss - a.loss));
+
+  return {
+    byDong, months, counts, evidence,
+    totalStartDelay, totalLoss,
+    totalClaimDays: totalStartDelay + totalLoss,
+    totalRows: rows.length,
+  };
+}
