@@ -113,6 +113,105 @@ export function calcInternalDashboard(buildingsInternal, logs, th = THRESHOLDS) 
   return { totalUnits, optionUnits, normalUnits, cumActual, cumPlan, overallRate, periodRate, totalWorkers, totalDays, byBuilding };
 }
 
+// ---------- 엑셀 달성률현황 시트 병합 (하이브리드) ----------
+//
+// 표시값 = ③달성률현황 시트의 값
+//        + 그 시트 수식 범위(coveredMaxRow) 밖에 있는 ②시트 실적
+//        + 아직 엑셀에 올리지 않은 앱 대기 입력분
+//
+// 이렇게 하는 이유:
+//  1) 엑셀 화면 숫자와 앱 숫자가 같아야 대조가 된다 → 시트 값을 기준으로 삼음
+//  2) 그런데 시트의 SUMIF 범위가 C5:C114처럼 고정이라 115행 이후 실적이 엑셀에서도 빠진다
+//     → 범위 밖 행을 앱이 보충해서 더함
+//  3) 앱에서 방금 입력한(아직 업로드 전) 건도 더해야 현장에서 바로 쓸 수 있다
+//
+// 각 동에 대해 근거를 basis 객체로 남겨 화면에 "532 (엑셀) + 7.7 (추가)" 형태로 표시합니다.
+
+function sumActual(list) {
+  return (list || []).reduce((s, x) => s + (Number(x?.actual) || 0), 0);
+}
+
+/**
+ * @param {object} dash        기존 calcExternalDashboard/calcInternalDashboard 결과 (폴백 겸 보조지표용)
+ * @param {object|null} achv   graphSync.readAchievement 결과
+ * @param {array} logs         ②시트에서 읽은 실적 행 (row 번호 포함)
+ * @param {array} pending      아직 업로드 안 된 앱 입력분
+ * @param {object} th          임계값
+ * @param {string} planKey     "planArea"(외부) | "totalUnits"(내부)
+ */
+export function mergeAchievement(dash, achv, logs, pending, th = THRESHOLDS, planKey = "planArea") {
+  if (!achv || !achv.byDong?.length) {
+    // 시트를 못 읽었으면 기존 재계산 결과를 그대로 사용 (동작 보장)
+    return { ...dash, source: "recalc" };
+  }
+
+  const covered = achv.coveredMaxRow;
+  const pendingList = pending || [];
+
+  const byBuilding = achv.byDong.map((row) => {
+    const sheetVal = Number(row.cumActual) || 0;
+
+    // 시트 수식 범위 밖의 행 (row 번호를 모르면 보충하지 않음 — 중복 합산 방지)
+    const extraRows = covered
+      ? (logs || []).filter((l) => l.dong === row.dong && Number(l.row) > covered)
+      : [];
+    const extra = sumActual(extraRows);
+
+    const pendingRows = pendingList.filter((p) => p.dong === row.dong);
+    const pendingSum = sumActual(pendingRows);
+
+    const cumActual = sheetVal + extra + pendingSum;
+    const plan = Number(row[planKey] ?? row.planArea ?? row.totalUnits) || 0;
+    const rate = plan > 0 ? cumActual / plan : 0;
+
+    return {
+      dong: row.dong,
+      planArea: plan,
+      totalUnits: row.totalUnits,
+      optionUnits: row.optionUnits,
+      cumActual,
+      rate,
+      remain: Math.max(0, plan - cumActual),
+      endDate: row.endDate,
+      // 시트가 계산해 둔 상태 문구가 있으면 쓰되, 보충분이 있으면 다시 판정
+      status: extra || pendingSum ? statusBadge(rate, th) : (row.statusText ? { label: row.statusText, color: statusBadge(rate, th).color } : statusBadge(rate, th)),
+      basis: {
+        sheet: sheetVal,
+        extra,
+        pending: pendingSum,
+        extraRowNums: extraRows.map((l) => l.row),
+        pendingCount: pendingRows.length,
+      },
+    };
+  });
+
+  const totalPlanArea = byBuilding.reduce((s, b) => s + (Number(b.planArea) || 0), 0);
+  const cumActual = byBuilding.reduce((s, b) => s + b.cumActual, 0);
+  const sheetCum = byBuilding.reduce((s, b) => s + b.basis.sheet, 0);
+  const addedCum = cumActual - sheetCum;
+
+  const overallRate = totalPlanArea > 0 ? cumActual / totalPlanArea : "";
+
+  // [주의] 상단 "전체 현황 요약" 지표는 시트 요약값(C6~C14)을 쓰지 않고 앱 재계산값을 유지합니다.
+  // 이 엑셀의 요약 수식들이 ②시트 5:114 범위로 고정돼 있어 최신 행이 빠지고,
+  // 특히 총 투입인원은 SUM(D5:D114)로 "석공(D열)"만 세고 코킹·트러스·비계(E~G)가 빠져 있습니다.
+  // 동별 표는 사용자가 엑셀 화면과 대조해야 하므로 시트 값을 기준으로 쓰지만,
+  // 요약 지표까지 틀린 값을 그대로 옮길 이유는 없습니다.
+  // 시트 요약값은 sheetSummary로 남겨 두어 대조·디버깅에 쓸 수 있게 합니다.
+  return {
+    ...dash,
+    source: "sheet",
+    sheetName: achv.sheetName,
+    coveredMaxRow: covered,
+    byBuilding,
+    totalPlanArea,
+    cumActual,
+    overallRate,
+    sheetSummary: achv.summary || {},
+    basis: { sheetCum, addedCum },
+  };
+}
+
 // ---------- ④만회계획·대응 ----------
 
 export function calcRecoveryPlan(dong, buildings, logs, today = new Date(), th = THRESHOLDS) {

@@ -220,6 +220,26 @@ export async function serializeWorkbook(wb) {
 const SHEET_EXTERNAL = "②일일실적입력";
 const SHEET_INTERNAL = "②일일실적입력(내부)";
 const SHEET_BASE = "①기준정보";
+export const SHEET_ACHV_EXTERNAL = "③달성률현황";
+export const SHEET_ACHV_INTERNAL = "내부 달성률현황";
+
+// 일일실적입력 시트의 입력 가능 행 범위.
+// [변경 이유] 예전에는 5~104행으로 하드코딩돼 있어서 105행부터의 실적이 통째로 무시됐고,
+// 시트가 104행까지 차면 앱에서 새 실적 저장 자체가 불가능했습니다.
+// 이제 시트의 실제 마지막 행을 기준으로 동적으로 잡습니다.
+const LOG_START_ROW = 5;
+const LOG_HARD_MAX_ROW = 2000; // 무한 스캔 방지용 상한
+
+// B열(날짜)에 값이 있는 마지막 행. 중간 빈 행이 있어도 끝까지 훑어 마지막을 찾습니다.
+function lastDataRow(ws, col = "B", start = LOG_START_ROW) {
+  const scanEnd = Math.min(Math.max(ws.rowCount || start, start), LOG_HARD_MAX_ROW);
+  let last = start - 1;
+  for (let r = start; r <= scanEnd; r++) {
+    const v = rawCell(ws, `${col}${r}`);
+    if (v !== null && v !== "") last = r;
+  }
+  return last;
+}
 
 // ExcelJS 셀 값을 단순 원시값(문자열/숫자/Date/null)으로 정규화.
 // - 수식 셀: { formula, result } → result
@@ -256,7 +276,8 @@ export function readExternalLogs(wb) {
   const ws = wb.getWorksheet(SHEET_EXTERNAL);
   if (!ws) return [];
   const out = [];
-  for (let r = 5; r <= 104; r++) {
+  const endRow = lastDataRow(ws);
+  for (let r = LOG_START_ROW; r <= endRow; r++) {
     const b = rawCell(ws, `B${r}`);
     if (b === null || b === "") continue;
     out.push({
@@ -282,7 +303,8 @@ export function readInternalLogs(wb) {
   const ws = wb.getWorksheet(SHEET_INTERNAL);
   if (!ws) return [];
   const out = [];
-  for (let r = 5; r <= 104; r++) {
+  const endRow = lastDataRow(ws);
+  for (let r = LOG_START_ROW; r <= endRow; r++) {
     const b = rawCell(ws, `B${r}`);
     if (b === null || b === "") continue;
     out.push({
@@ -392,7 +414,8 @@ export function readAreaLogs(wb, sheetName) {
   const ws = wb.getWorksheet(sheetName);
   if (!ws) return [];
   const out = [];
-  for (let r = 5; r <= 104; r++) {
+  const endRow = lastDataRow(ws);
+  for (let r = LOG_START_ROW; r <= endRow; r++) {
     const b = rawCell(ws, `B${r}`);
     if (b === null || b === "") continue;
     out.push({
@@ -490,12 +513,13 @@ export function appendAreaRow(wb, sheetName, planRange, entry) {
   return row;
 }
 
-function findNextEmptyRow(ws, startRow = 5, endRow = 104) {
-  for (let r = startRow; r <= endRow; r++) {
-    const b = rawCell(ws, `B${r}`);
-    if (b === null || b === "") return r;
-  }
-  return null; // 시트가 가득 찼음
+// 새 실적을 쓸 행 = 마지막 데이터 행의 바로 다음 행.
+// [변경 이유] 예전에는 5~104행만 훑어서, 시트가 104행까지 차면 중간 빈 행에 덮어쓰거나
+// "입력 가능한 행이 모두 채워졌습니다" 오류로 저장이 아예 막혔습니다.
+function findNextEmptyRow(ws, startRow = LOG_START_ROW) {
+  const last = lastDataRow(ws, "B", startRow);
+  const next = Math.max(last + 1, startRow);
+  return next <= LOG_HARD_MAX_ROW ? next : null;
 }
 
 // 입력 행은 템플릿(5~104행)에 이미 색·글꼴·표시형식이 들어 있으므로 "값만" 채웁니다.
@@ -561,6 +585,192 @@ export function appendInternalRow(wb, entry) {
   ws.getCell(`N${row}`).value = entry.memo || "";
 
   return row;
+}
+
+// ===== ③달성률현황 / 내부 달성률현황 시트 읽기 =====
+// 엑셀이 이미 계산해 둔 "동별 달성률 현황" 표를 그대로 읽어옵니다.
+// 앱이 ②시트에서 자체 재계산하던 값과 엑셀 화면 숫자가 어긋나던 문제를 없애기 위함입니다.
+//
+// [핵심 주의] 이 시트의 값은 "엑셀에서 마지막으로 재계산·저장된 시점"의 값입니다.
+// ExcelJS는 수식을 계산하지 않고 파일에 저장된 캐시 결과만 읽습니다.
+// 게다가 이 시트의 SUMIF 범위는 ②일일실적입력!C5:C114 처럼 행이 고정돼 있어
+// 그 범위를 넘어선 최신 실적은 엑셀 숫자에도 빠져 있습니다.
+// 그래서 수식에서 참조 범위의 끝 행(coveredMaxRow)까지 같이 뽑아내,
+// 앱이 그 뒤 행들을 보충 합산할 수 있게 합니다. (calc.js의 mergeAchievement)
+
+// 셀 주소에서 열 문자만 (예: "D21" → "D")
+function colLetter(n) {
+  let s = "";
+  let x = n;
+  while (x > 0) {
+    const m = (x - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    x = Math.floor((x - 1) / 26);
+  }
+  return s;
+}
+
+// 수식 문자열에서 참조된 범위들의 "끝 행 번호" 중 최대값을 뽑음.
+// 예) 'IFERROR(SUMIF(②일일실적입력!C5:C114,"104동",②일일실적입력!J5:J114),0)' → 114
+function formulaMaxRefRow(formula) {
+  if (typeof formula !== "string") return null;
+  let max = null;
+  const re = /\$?[A-Z]{1,3}\$?(\d+)\s*:\s*\$?[A-Z]{1,3}\$?(\d+)/g;
+  let m;
+  while ((m = re.exec(formula)) !== null) {
+    const end = parseInt(m[2], 10);
+    if (isFinite(end) && (max === null || end > max)) max = end;
+  }
+  return max;
+}
+
+// 셀의 원본 수식(있으면)을 반환
+function cellFormula(ws, addr) {
+  const v = ws.getCell(addr).value;
+  if (v && typeof v === "object" && typeof v.formula === "string") return v.formula;
+  return null;
+}
+
+// 헤더 행에서 라벨로 열을 찾아 매핑. 열 위치가 바뀌어도 따라갑니다.
+const ACHV_COL_SPECS = [
+  { key: "dong", test: (s) => s.includes("동") && (s.includes("구역") || s === "동") },
+  { key: "planArea", test: (s) => s.includes("계획수량") },
+  { key: "totalUnits", test: (s) => s.includes("전체세대수") },
+  { key: "optionUnits", test: (s) => s.includes("옵션세대수") },
+  { key: "cumActual", test: (s) => s.includes("누적실적") },
+  { key: "rate", test: (s) => s.includes("달성률") },
+  { key: "remain", test: (s) => s.includes("잔여") },
+  { key: "endDate", test: (s) => s.includes("완료예정") },
+  { key: "status", test: (s) => s.includes("상태") },
+];
+
+function mapAchvColumns(ws, headerRow, maxCol = 14) {
+  const map = {};
+  for (let c = 1; c <= maxCol; c++) {
+    const raw = rawCell(ws, `${colLetter(c)}${headerRow}`);
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const norm = raw.replace(/\s/g, "");
+    for (const spec of ACHV_COL_SPECS) {
+      if (map[spec.key] !== undefined) continue;
+      if (spec.test(norm)) map[spec.key] = colLetter(c);
+    }
+  }
+  return map;
+}
+
+// "▶ ... 동별 ... 현황" 블록의 헤더 행을 찾음 (B열 스캔)
+function findAchvHeaderRow(ws, maxRow) {
+  for (let r = 1; r <= maxRow; r++) {
+    const b = rawCell(ws, `B${r}`);
+    if (typeof b !== "string") continue;
+    const s = b.replace(/\s/g, "");
+    if (s.startsWith("▶") && s.includes("동별") && s.includes("달성률")) return r + 1; // 다음 행이 컬럼 제목 행
+  }
+  // 폴백: "동(구역)"이 들어간 행을 직접 찾음
+  for (let r = 1; r <= maxRow; r++) {
+    const b = rawCell(ws, `B${r}`);
+    if (typeof b === "string" && b.replace(/\s/g, "").includes("동(구역)")) return r;
+  }
+  return null;
+}
+
+// 상단 "▶ 전체 ... 현황 요약" 블록: B=항목명, C=값 을 라벨→값 맵으로 읽음
+const ACHV_SUMMARY_SPECS = [
+  { key: "totalPlanArea", match: "전체계획수량" },
+  { key: "totalUnits", match: "전체세대수" },
+  { key: "optionUnits", match: "옵션세대수" },
+  { key: "normalUnits", match: "일반세대수" },
+  { key: "cumActual", match: "누적실제시공량" },
+  { key: "cumPlan", match: "누적계획량" },
+  { key: "overallRate", match: "전체달성률" },
+  { key: "periodRate", match: "기간달성률" },
+  { key: "totalWorkers", match: "총투입인원" },
+  { key: "perWorker", match: "1인당평균시공량" },
+  { key: "disasterDays", match: "천재지변발생일수" },
+  { key: "totalDays", match: "작업총일수" },
+];
+
+function readAchvSummary(ws, maxRow) {
+  const out = {};
+  const covered = {};
+  for (let r = 1; r <= maxRow; r++) {
+    const label = rawCell(ws, `B${r}`);
+    if (typeof label !== "string" || !label.trim()) continue;
+    const norm = label.replace(/\s/g, "");
+    for (const sp of ACHV_SUMMARY_SPECS) {
+      if (out[sp.key] !== undefined) continue;
+      if (norm.includes(sp.match)) {
+        const v = rawCell(ws, `C${r}`);
+        const n = Number(v);
+        out[sp.key] = isFinite(n) && v !== "" && v !== null ? n : v;
+        const mr = formulaMaxRefRow(cellFormula(ws, `C${r}`));
+        if (mr) covered[sp.key] = mr;
+      }
+    }
+  }
+  return { summary: out, summaryCovered: covered };
+}
+
+/**
+ * 달성률현황 시트를 읽어 { byDong, summary, coveredMaxRow, sheetName } 반환.
+ * 시트가 없거나 표를 못 찾으면 null → 호출측에서 기존 재계산 방식으로 폴백.
+ */
+export function readAchievement(wb, sheetName) {
+  let ws = wb.getWorksheet(sheetName);
+  if (!ws) {
+    // 시트명이 바뀐 경우를 대비해 "달성률"이 들어간 시트로 폴백 (내부/외부 구분 유지)
+    const wantInternal = String(sheetName).includes("내부");
+    ws = wb.worksheets.find(
+      (w) => w?.name?.includes("달성률") && String(w.name).includes("내부") === wantInternal
+    );
+  }
+  if (!ws) return null;
+
+  const maxRow = Math.min(ws.rowCount || 100, 500);
+  const headerRow = findAchvHeaderRow(ws, maxRow);
+  if (!headerRow) return null;
+
+  const cols = mapAchvColumns(ws, headerRow);
+  if (!cols.dong || !cols.cumActual) return null;
+
+  const byDong = [];
+  let coveredMaxRow = null;
+  for (let r = headerRow + 1; r <= maxRow; r++) {
+    const dongRaw = rawCell(ws, `${cols.dong}${r}`);
+    const dong = dongRaw == null ? "" : String(dongRaw).trim();
+    if (!dong) continue;
+    if (dong.replace(/\s/g, "").startsWith("합계")) break; // 합계 행에서 종료
+    if (dong.startsWith("▶")) break;                       // 다음 블록에서 종료
+
+    const num = (key) => {
+      if (!cols[key]) return null;
+      const v = rawCell(ws, `${cols[key]}${r}`);
+      const n = Number(v);
+      return isFinite(n) && v !== "" && v !== null ? n : null;
+    };
+
+    // 누적실적 셀의 수식에서 참조 범위 끝 행을 뽑아둠 (보충 합산 기준)
+    const mr = formulaMaxRefRow(cellFormula(ws, `${cols.cumActual}${r}`));
+    if (mr && (coveredMaxRow === null || mr > coveredMaxRow)) coveredMaxRow = mr;
+
+    byDong.push({
+      dong,
+      planArea: num("planArea"),
+      totalUnits: num("totalUnits"),
+      optionUnits: num("optionUnits"),
+      cumActual: num("cumActual") ?? 0,
+      rate: num("rate"),
+      remain: num("remain"),
+      endDate: excelDateToISO(rawCell(ws, cols.endDate ? `${cols.endDate}${r}` : `Z${r}`)),
+      statusText: cols.status ? String(rawCell(ws, `${cols.status}${r}`) ?? "") : "",
+    });
+  }
+
+  if (!byDong.length) return null;
+
+  const { summary, summaryCovered } = readAchvSummary(ws, headerRow - 1);
+
+  return { sheetName: ws.name, byDong, summary, summaryCovered, coveredMaxRow };
 }
 
 // ===== ⑥ 석재발주 시트(발주현황) 읽기 =====
@@ -653,7 +863,9 @@ export async function syncDown(site) {
   const logsInternal = readInternalLogs(wb);
   const orderRows = readOrderStatus(wb);
   const thresholds = readThresholds(wb);
-  return { wb, itemId, buildings, logsExternal, logsInternal, orderRows, thresholds, syncedAt: new Date().toISOString() };
+  const achvExternal = readAchievement(wb, SHEET_ACHV_EXTERNAL);
+  const achvInternal = readAchievement(wb, SHEET_ACHV_INTERNAL);
+  return { wb, itemId, buildings, logsExternal, logsInternal, orderRows, thresholds, achvExternal, achvInternal, syncedAt: new Date().toISOString() };
 }
 
 export async function syncUp(wb, itemId) {

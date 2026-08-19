@@ -5,7 +5,7 @@ import {
 } from "./data";
 import {
   calcRowExternal, calcRowInternal, calcExternalDashboard, calcInternalDashboard,
-  calcRecoveryPlan, calcOrderStatus, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
+  calcRecoveryPlan, calcOrderStatus, mergeAchievement, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
 } from "./calc";
 import { Storage } from "./storage";
 import * as Graph from "./graphSync";
@@ -90,6 +90,9 @@ export default function App() {
   const [checklist, setChecklist] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
   const [orderRows, setOrderRows] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.orderRows, activeSiteId), initialIsDefault ? SEED_ORDER_ROWS : []));
   const [thresholds, setThresholds] = useState(() => ({ ...THRESHOLDS, ...Storage.get(Storage.siteKey(Storage.KEYS.thresholds, activeSiteId), {}) }));
+  // 엑셀 ③달성률현황 / 내부 달성률현황 시트에서 읽어온 동별 달성률 표 (없으면 null → 기존 재계산으로 폴백)
+  const [achvExternal, setAchvExternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.achvExternal, activeSiteId), null));
+  const [achvInternal, setAchvInternal] = useState(() => Storage.get(Storage.siteKey(Storage.KEYS.achvInternal, activeSiteId), null));
 
   const dongListsArea = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, (areaB[s.key] || []).map((b) => b.dong)])), [areaB]);
   const dongListInternal = useMemo(() => [...buildingsInternal.map((b) => b.dong), EXTRA_INTERNAL_DONG], [buildingsInternal]);
@@ -122,6 +125,8 @@ export default function App() {
     setChecklist(Storage.get(Storage.siteKey(Storage.KEYS.checklist, activeSiteId), {}));
     setOrderRows(Storage.get(Storage.siteKey(Storage.KEYS.orderRows, activeSiteId), isDef ? SEED_ORDER_ROWS : []));
     setThresholds({ ...THRESHOLDS, ...Storage.get(Storage.siteKey(Storage.KEYS.thresholds, activeSiteId), {}) });
+    setAchvExternal(Storage.get(Storage.siteKey(Storage.KEYS.achvExternal, activeSiteId), null));
+    setAchvInternal(Storage.get(Storage.siteKey(Storage.KEYS.achvInternal, activeSiteId), null));
     setSync({ state: "idle", message: "", lastSyncedAt: Storage.get(Storage.siteKey(Storage.KEYS.fileMeta, activeSiteId), {})?.lastSyncedAt || null });
     wbRef.current = null;
     itemIdRef.current = null;
@@ -136,6 +141,8 @@ export default function App() {
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.checklist, currentSiteIdRef.current), checklist); }, [checklist]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.orderRows, currentSiteIdRef.current), orderRows); }, [orderRows]);
   useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.thresholds, currentSiteIdRef.current), thresholds); }, [thresholds]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.achvExternal, currentSiteIdRef.current), achvExternal); }, [achvExternal]);
+  useEffect(() => { Storage.set(Storage.siteKey(Storage.KEYS.achvInternal, currentSiteIdRef.current), achvInternal); }, [achvInternal]);
 
   useEffect(() => {
     setAreaForms((prev) => {
@@ -178,8 +185,18 @@ export default function App() {
     }
   }, [justLoggedIn, account]);
 
-  const areaDash = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => [s.key, calcExternalDashboard(areaB[s.key] || [], areaL[s.key] || [], thresholds)])), [areaB, areaL, thresholds]);
-  const dashInternal = useMemo(() => calcInternalDashboard(buildingsInternal, logsInternal, thresholds), [buildingsInternal, logsInternal, thresholds]);
+  // 외부(아파트)는 엑셀 ③달성률현황 시트 값을 기준으로 삼고, 시트 수식 범위 밖의 최신 실적과
+  // 아직 업로드 안 된 앱 입력분을 더해서 보여줍니다(하이브리드). 호이스트/부대시설은 전용 달성률
+  // 시트가 없으므로 기존 재계산을 그대로 씁니다.
+  const areaDash = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => {
+    const base = calcExternalDashboard(areaB[s.key] || [], areaL[s.key] || [], thresholds);
+    if (s.key !== "external") return [s.key, { ...base, source: "recalc" }];
+    return [s.key, mergeAchievement(base, achvExternal, areaL[s.key] || [], areaP[s.key] || [], thresholds, "planArea")];
+  })), [areaB, areaL, areaP, thresholds, achvExternal]);
+  const dashInternal = useMemo(() => {
+    const base = calcInternalDashboard(buildingsInternal, logsInternal, thresholds);
+    return mergeAchievement(base, achvInternal, logsInternal, pendingInternal, thresholds, "totalUnits");
+  }, [buildingsInternal, logsInternal, pendingInternal, thresholds, achvInternal]);
   const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaL[recoveryScope] || [], new Date(), thresholds), [recoveryDong, recoveryScope, areaB, areaL, thresholds]);
   const orderDash = useMemo(() => calcOrderStatus(orderRows), [orderRows]);
 
@@ -242,6 +259,9 @@ export default function App() {
       setAreaB(newB);
       setAreaL(newL);
       setAreaFields(newFields);
+
+      setAchvExternal(result.achvExternal ?? Graph.readAchievement(wb, Graph.SHEET_ACHV_EXTERNAL));
+      setAchvInternal(result.achvInternal ?? Graph.readAchievement(wb, Graph.SHEET_ACHV_INTERNAL));
 
       setOrderRows(result.orderRows || Graph.readOrderStatus(wb));
       setThresholds({ ...THRESHOLDS, ...(result.thresholds || Graph.readThresholds(wb)) });
@@ -577,6 +597,37 @@ function InputTab({ scope, setScope, areaForms, setAreaForm, saveArea, areaField
   );
 }
 
+// 이 화면 숫자가 어디서 온 것인지 한 줄로 밝혀 줍니다.
+// "엑셀 ③달성률현황 기준" 인지, 앱이 직접 재계산한 값인지 헷갈리지 않도록.
+function SourceNote({ dash }) {
+  if (dash.source !== "sheet") {
+    return <p className="meta">앱이 ②일일실적입력에서 직접 재계산한 값입니다. (달성률현황 시트를 읽지 못함)</p>;
+  }
+  const added = Number(dash.basis?.addedCum) || 0;
+  return (
+    <p className="meta">
+      엑셀 「{dash.sheetName}」 시트 기준
+      {dash.coveredMaxRow ? ` (시트 수식 범위 ~${dash.coveredMaxRow}행)` : ""}
+      {added > 0 && ` + 그 이후 실적 ${fmtNum(added)} m² 보충 합산`}
+    </p>
+  );
+}
+
+// 동별 실적 숫자 밑에 "532 엑셀 + 7.7 추가" 형태로 근거를 작게 표시
+function Basis({ basis }) {
+  if (!basis) return null;
+  const extra = Number(basis.extra) || 0;
+  const pending = Number(basis.pending) || 0;
+  if (!extra && !pending) return null;
+  return (
+    <div className="meta" style={{ fontSize: "0.75em", lineHeight: 1.3 }}>
+      {fmtNum(basis.sheet)} 엑셀
+      {extra > 0 && ` + ${fmtNum(extra)} 추가행`}
+      {pending > 0 && ` + ${fmtNum(pending)} 미동기화`}
+    </div>
+  );
+}
+
 function AreaDashCard({ scope, dash }) {
   return (
     <>
@@ -595,6 +646,7 @@ function AreaDashCard({ scope, dash }) {
       </div>
       <div className="card">
         <h2>동별 달성률 현황</h2>
+        <SourceNote dash={dash} />
         <table className="dashtable">
           <thead><tr><th>동</th><th>계획(m²)</th><th>실적(m²)</th><th>달성률</th><th>상태</th></tr></thead>
           <tbody>
@@ -602,7 +654,7 @@ function AreaDashCard({ scope, dash }) {
               <tr key={b.dong}>
                 <td className="dong">{b.dong}</td>
                 <td>{fmtNum(b.planArea)}</td>
-                <td>{fmtNum(b.cumActual)}</td>
+                <td>{fmtNum(b.cumActual)}<Basis basis={b.basis} /></td>
                 <td>{fmtPct(b.rate)}</td>
                 <td style={{ color: b.status.color }}>{b.status.label}</td>
               </tr>
@@ -699,6 +751,7 @@ function DashTab({ scope, setScope, areaDash, dashInternal, orderDash }) {
           </div>
           <div className="card">
             <h2>동별 내부(세대) 달성률 현황</h2>
+            <SourceNote dash={dashInternal} />
             <table className="dashtable">
               <thead><tr><th>동</th><th>전체세대</th><th>실적</th><th>달성률</th><th>상태</th></tr></thead>
               <tbody>
@@ -706,7 +759,7 @@ function DashTab({ scope, setScope, areaDash, dashInternal, orderDash }) {
                   <tr key={b.dong}>
                     <td className="dong">{b.dong}</td>
                     <td>{b.totalUnits}</td>
-                    <td>{fmtNum(b.cumActual)}</td>
+                    <td>{fmtNum(b.cumActual)}<Basis basis={b.basis} /></td>
                     <td>{fmtPct(b.rate)}</td>
                     <td style={{ color: b.status.color }}>{b.status.label}</td>
                   </tr>
