@@ -492,7 +492,7 @@ export function appendAreaRow(wb, sheetName, planRange, entry) {
   const ws = wb.getWorksheet(sheetName);
   if (!ws) throw new Error(`시트를 찾을 수 없습니다: ${sheetName}`);
   const row = findNextEmptyRow(ws);
-  if (!row) throw new Error(`${sheetName} 시트의 입력 가능한 행(5~104)이 모두 채워졌습니다.`);
+  if (!row) throw new Error(`${sheetName} 시트에 새 행을 추가할 수 없습니다 (행 상한 초과).`);
   const templateRow = row > 5 ? row - 1 : 5;
 
   ws.getCell(`A${row}`).value = row - 4;
@@ -503,7 +503,14 @@ export function appendAreaRow(wb, sheetName, planRange, entry) {
   ws.getCell(`F${row}`).value = Number(entry.truss) || 0;
   ws.getCell(`G${row}`).value = Number(entry.scaffold) || 0;
   ws.getCell(`H${row}`).value = { formula: `SUM(D${row}:G${row})` };
-  ws.getCell(`I${row}`).value = { formula: `IFERROR(IF(C${row}="","",VLOOKUP(C${row},${planRange},6,0)),"")` };
+  // 목표 시공량(I열)은 시트마다 규칙이 다릅니다.
+  //   ②일일실적입력 = H*11 / ②일일실적입력(부대시설) = D*9 / ②일일실적입력(호이스트) = VLOOKUP 계획일평균
+  // 그래서 바로 윗 행(템플릿)의 수식을 그대로 물려받고, 행 번호만 바꿔 씁니다.
+  // 못 읽으면 기존처럼 기준정보 계획일평균 VLOOKUP으로 폴백합니다.
+  const inherited = shiftFormulaRow(cellFormulaOf(ws, `I${templateRow}`), templateRow, row);
+  ws.getCell(`I${row}`).value = {
+    formula: inherited || `IFERROR(IF(C${row}="","",VLOOKUP(C${row},${planRange},6,0)),"")`,
+  };
   ws.getCell(`J${row}`).value = entry.actual === "" || entry.actual === null ? 0 : Number(entry.actual);
   ws.getCell(`K${row}`).value = { formula: `IFERROR(IF(OR(J${row}="",I${row}="",I${row}=0),"",J${row}/I${row}),"")` };
   ws.getCell(`L${row}`).value = entry.disaster || "";
@@ -511,6 +518,27 @@ export function appendAreaRow(wb, sheetName, planRange, entry) {
   ws.getCell(`N${row}`).value = entry.note || "";
   ws.getCell(`O${row}`).value = entry.memo || "";
   return row;
+}
+
+// 셀의 원본 수식 문자열(없으면 null)
+function cellFormulaOf(ws, addr) {
+  const v = ws.getCell(addr).value;
+  if (v && typeof v === "object" && typeof v.formula === "string") return v.formula;
+  return null;
+}
+
+// 상대참조 행 번호만 옮긴다: "D23*9" (23→24) → "D24*9".
+// 절대참조($B$6)는 열 문자 뒤에 "$"가 붙어 패턴에 걸리지 않고, 숫자 리터럴(*9, 11)도
+// 앞에 열 문자가 없어 걸리지 않는다. (구형 사파리 호환 위해 lookbehind 미사용)
+function shiftFormulaRow(formula, fromRow, toRow) {
+  if (!formula || fromRow === toRow) return formula;
+  const re = new RegExp(`([A-Z]{1,3})${fromRow}(?![0-9])`, "g");
+  return formula.replace(re, (m, col, offset, str) => {
+    const prev = offset > 0 ? str[offset - 1] : "";
+    // 앞 글자가 영문/숫자/$ 이면 셀 주소가 아니거나 절대참조 → 그대로 둔다
+    if (/[A-Za-z0-9$]/.test(prev)) return m;
+    return `${col}${toRow}`;
+  });
 }
 
 // 새 실적을 쓸 행 = 마지막 데이터 행의 바로 다음 행.
@@ -539,7 +567,7 @@ export function appendExternalRow(wb, entry) {
   const ws = wb.getWorksheet(SHEET_EXTERNAL);
   if (!ws) throw new Error(`시트를 찾을 수 없습니다: ${SHEET_EXTERNAL}`);
   const row = findNextEmptyRow(ws);
-  if (!row) throw new Error("일일실적입력 시트의 입력 가능한 행(5~104)이 모두 채워졌습니다.");
+  if (!row) throw new Error("②일일실적입력 시트에 새 행을 추가할 수 없습니다 (행 상한 초과).");
   const templateRow = row > 5 ? row - 1 : 5;
 
   ws.getCell(`A${row}`).value = row - 4;
@@ -566,7 +594,7 @@ export function appendInternalRow(wb, entry) {
   const ws = wb.getWorksheet(SHEET_INTERNAL);
   if (!ws) throw new Error(`시트를 찾을 수 없습니다: ${SHEET_INTERNAL}`);
   const row = findNextEmptyRow(ws);
-  if (!row) throw new Error("일일실적입력(내부) 시트의 입력 가능한 행(5~104)이 모두 채워졌습니다.");
+  if (!row) throw new Error("②일일실적입력(내부) 시트에 새 행을 추가할 수 없습니다 (행 상한 초과).");
   const templateRow = row > 5 ? row - 1 : 5;
 
   ws.getCell(`A${row}`).value = row - 4;
@@ -778,7 +806,7 @@ export function readAchievement(wb, sheetName) {
 // {dong, stone, gubun, ea, m2, m} 목록으로 반환합니다. 동별 합계·석종 소계는 앱(calc)에서
 // 이 말단 행들을 직접 재집계하므로, 사용자가 같은 형식으로 행을 추가하면 자동으로 반영됩니다.
 const ORDER_SHEET_HINT = "발주";
-const KNOWN_STONES = ["보니브라운", "스틸그레이", "마천석", "포천석"];
+const KNOWN_STONES = ["보니브라운", "스틸그레이", "마천석", "포천석", "블랑코머핀"];
 
 function orderSheetCandidates(wb) {
   const named = wb.worksheets.filter((ws) => ws && ws.name && ws.name.includes(ORDER_SHEET_HINT));
