@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  BUILDINGS_EXTERNAL, BUILDINGS_INTERNAL, SEED_LOGS_EXTERNAL, SEED_LOGS_INTERNAL,
+  BUILDINGS_EXTERNAL, BUILDINGS_INTERNAL, BUILDINGS_FACILITY, SEED_LOGS_EXTERNAL, SEED_LOGS_INTERNAL,
   DISASTER_OPTIONS, REASON_CODES, THRESHOLDS, SEED_ORDER_ROWS,
 } from "./data";
 import {
   calcRowExternal, calcRowInternal, calcExternalDashboard, calcInternalDashboard,
   calcRecoveryPlan, calcOrderStatus, mergeAchievement, fmtPct, fmtNum, RECOVERY_CHECKLIST, DISASTER_MANUAL,
   calcScheduleStatus, calcManpowerCurve, calcClaimSummary, GATE_KEYS, GATE_LABELS,
+  resolveFacilityLogs, facilityUnassigned,
 } from "./calc";
 import { Storage } from "./storage";
 import * as Graph from "./graphSync";
@@ -21,11 +22,15 @@ const EXTRA_INTERNAL_DONG = "게스트하우스";
 // 면적(m²)형 공사 범위 — 외부/호이스트/부대시설은 동일한 시트 구조라 같은 계산 로직을 공유.
 // 새 면적형 범위가 생기면 엑셀에 시트(②일일실적입력(○○))와 기준정보 블록(▶ ○○ 수량)을 추가하고
 // 여기에 한 줄만 더 넣으면 앱 화면에 자동으로 추가됩니다.
+// plannedMode = 그 시트의 "목표 시공량"(I열) 산정 방식. 엑셀 시트 수식과 일치시킨 값.
+// unitName = 화면에서 "동" 대신 쓸 표기 (부대시설은 동이 아니라 구역).
 const AREA_SCOPES = [
-  { key: "external", label: "외부(아파트)", sheet: "②일일실적입력", planLabel: "동별 시공 계획 수량", planRange: "①기준정보!$B$6:$G$13" },
-  { key: "hoist", label: "호이스트", sheet: "②일일실적입력(호이스트)", planLabel: "호이스트 시공 계획 수량", planRange: "①기준정보!$B$18:$G$25" },
-  { key: "facility", label: "부대시설", sheet: "②일일실적입력(부대시설)", planLabel: "부대시설 계획 수량", planRange: "①기준정보!$B$30:$G$37" },
+  { key: "external", label: "외부(아파트)", sheet: "②일일실적입력", planLabel: "동별 시공 계획 수량", planRange: "①기준정보!$B$6:$G$13", plannedMode: "workers11", unitName: "동" },
+  { key: "hoist", label: "호이스트", sheet: "②일일실적입력(호이스트)", planLabel: "호이스트 시공 계획 수량", planRange: "①기준정보!$B$18:$G$25", plannedMode: "plan", unitName: "동" },
+  { key: "facility", label: "부대시설", sheet: "②일일실적입력(부대시설)", planLabel: "부대시설 계획 수량", planRange: "①기준정보!$B$30:$G$37", plannedMode: "masonry9", unitName: "구역" },
 ];
+const SCOPE_BY_KEY = Object.fromEntries(AREA_SCOPES.map((s) => [s.key, s]));
+const plannedModeOf = (key) => SCOPE_BY_KEY[key]?.plannedMode || "plan";
 const AREA_KEYS = AREA_SCOPES.map((s) => s.key);
 const AREA_STORAGE = {
   external: { b: Storage.KEYS.buildingsExternal, l: Storage.KEYS.logsExternal, p: Storage.KEYS.pendingExternal },
@@ -59,9 +64,10 @@ function loadAreaMap(kind, siteId, isDefault) {
   for (const s of AREA_SCOPES) {
     const base = AREA_STORAGE[s.key][kind];
     let fallback = [];
-    if (s.key === "external" && isDefault) {
-      if (kind === "b") fallback = BUILDINGS_EXTERNAL;
-      else if (kind === "l") fallback = SEED_LOGS_EXTERNAL;
+    if (isDefault) {
+      if (s.key === "external" && kind === "b") fallback = BUILDINGS_EXTERNAL;
+      else if (s.key === "external" && kind === "l") fallback = SEED_LOGS_EXTERNAL;
+      else if (s.key === "facility" && kind === "b") fallback = BUILDINGS_FACILITY;
     }
     m[s.key] = Storage.get(Storage.siteKey(base, siteId), fallback);
   }
@@ -196,16 +202,24 @@ export default function App() {
   // 외부(아파트)는 엑셀 ③달성률현황 시트 값을 기준으로 삼고, 시트 수식 범위 밖의 최신 실적과
   // 아직 업로드 안 된 앱 입력분을 더해서 보여줍니다(하이브리드). 호이스트/부대시설은 전용 달성률
   // 시트가 없으므로 기존 재계산을 그대로 씁니다.
+  // 부대시설 실적은 시트 C열이 전부 "부대시설"이라 그대로는 구역별로 갈리지 않습니다.
+  // 엑셀 ③달성률현황의 부대시설 표와 같은 규칙(구역명 일치 → 비고 키워드)으로 구역을 배정한 뒤 계산합니다.
+  const areaLCalc = useMemo(() => ({
+    ...areaL,
+    facility: resolveFacilityLogs(areaL.facility || [], dongListsArea.facility || []),
+  }), [areaL, dongListsArea]);
+  const facilityUnclassified = useMemo(() => facilityUnassigned(areaLCalc.facility), [areaLCalc]);
+
   const areaDash = useMemo(() => Object.fromEntries(AREA_SCOPES.map((s) => {
-    const base = calcExternalDashboard(areaB[s.key] || [], areaL[s.key] || [], thresholds);
-    if (s.key !== "external") return [s.key, { ...base, source: "recalc" }];
-    return [s.key, mergeAchievement(base, achvExternal, areaL[s.key] || [], areaP[s.key] || [], thresholds, "planArea")];
-  })), [areaB, areaL, areaP, thresholds, achvExternal]);
+    const base = calcExternalDashboard(areaB[s.key] || [], areaLCalc[s.key] || [], thresholds, s.plannedMode);
+    if (s.key !== "external") return [s.key, { ...base, source: "recalc", unassigned: s.key === "facility" ? facilityUnclassified : 0 }];
+    return [s.key, mergeAchievement(base, achvExternal, areaLCalc[s.key] || [], areaP[s.key] || [], thresholds, "planArea")];
+  })), [areaB, areaLCalc, areaP, thresholds, achvExternal, facilityUnclassified]);
   const dashInternal = useMemo(() => {
     const base = calcInternalDashboard(buildingsInternal, logsInternal, thresholds);
     return mergeAchievement(base, achvInternal, logsInternal, pendingInternal, thresholds, "totalUnits");
   }, [buildingsInternal, logsInternal, pendingInternal, thresholds, achvInternal]);
-  const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaL[recoveryScope] || [], new Date(), thresholds), [recoveryDong, recoveryScope, areaB, areaL, thresholds]);
+  const recovery = useMemo(() => calcRecoveryPlan(recoveryDong, areaB[recoveryScope] || [], areaLCalc[recoveryScope] || [], new Date(), thresholds), [recoveryDong, recoveryScope, areaB, areaLCalc, thresholds]);
   const orderDash = useMemo(() => calcOrderStatus(orderRows), [orderRows]);
 
   // 공기 관리 — 착수지연/공기손실/인력소요/클레임. 외부(아파트) 기준.
@@ -274,7 +288,7 @@ export default function App() {
         const b = Graph.readAreaBuildings(wb, s.planLabel);
         // 파일이 진실원천 — 읽은 결과를 그대로 반영(빈 값이면 비움). 묵은 데이터가 남지 않게 함.
         newB[s.key] = b;
-        newL[s.key] = Graph.readAreaLogs(wb, s.sheet).map((l) => calcRowExternal(l, b));
+        newL[s.key] = Graph.readAreaLogs(wb, s.sheet).map((l) => calcRowExternal(l, b, s.plannedMode));
         const f = Graph.readAreaFields(wb, s.sheet);
         newFields[s.key] = f.length ? f : DEFAULT_AREA_FIELDS;
       }
@@ -349,7 +363,7 @@ export default function App() {
       note: form.note,
       memo: form.memo,
     };
-    setAreaL((prev) => ({ ...prev, [key]: [...(prev[key] || []), calcRowExternal(entry, areaB[key] || [])] }));
+    setAreaL((prev) => ({ ...prev, [key]: [...(prev[key] || []), calcRowExternal(entry, areaB[key] || [], plannedModeOf(key))] }));
     setAreaP((prev) => ({ ...prev, [key]: [...(prev[key] || []), entry] }));
     setAreaForms((prev) => ({ ...prev, [key]: emptyAreaForm(dongListsArea[key]) }));
     if (account) setTimeout(runSync, 50);
@@ -406,7 +420,7 @@ export default function App() {
             scope={inputScope} setScope={setInputScope}
             areaForms={areaForms} setAreaForm={setAreaForm} saveArea={saveArea} areaFields={areaFields}
             formInternal={formInternal} setFormInternal={setFormInternal} saveInternal={saveInternal}
-            areaL={areaL} logsInternal={logsInternal}
+            areaL={areaLCalc} logsInternal={logsInternal}
             dongListsArea={dongListsArea} dongListInternal={dongListInternal}
           />
         )}
@@ -869,7 +883,7 @@ function RecentList({ logs, unit }) {
         {logs.slice(-8).reverse().map((l) => (
           <div key={l.id} className="entryitem">
             <div>
-              <div>{l.dong} · 실적 {fmtNum(l.actual)}{unit}</div>
+              <div>{l.dong || (l.unassigned ? "구역 미분류" : "(자동)")} · 실적 {fmtNum(l.actual)}{unit}</div>
               <div className="meta">{l.date} · 달성률 {fmtPct(l.rate)}</div>
             </div>
             {l.disaster && l.disaster !== "N (정상)" && <span className="pill dot-warn">{l.disaster}</span>}
@@ -893,24 +907,30 @@ function pairRows(fields) {
 
 function AreaInputCard({ scope, form, setForm, onSave, dongList, fields }) {
   const workerFields = fields && fields.length ? fields : DEFAULT_AREA_FIELDS;
+  const unit = scope.unitName || "동";
   return (
     <div className="card">
       <h2>일일 실적 입력 · {scope.label}</h2>
       <Field label="날짜">
         <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} />
       </Field>
-      <Field label="해당 동(구역)">
+      <Field label={`해당 ${unit}(구역)`}>
         {/* 비 오는 날처럼 조업을 못 한 날은 동을 고르지 않아도 됩니다.
             빈 값으로 두면 직전에 작업하던 동이 자동으로 적용됩니다. */}
         <select value={form.dong} onChange={(e) => setForm({ ...form, dong: e.target.value })}>
-          <option value="">(자동) 직전 작업 동 — 천재지변·조업불가일용</option>
+          <option value="">(자동) 직전 작업 {unit} — 천재지변·조업불가일용</option>
           {dongList.length === 0 && <option value="">(기준정보 없음 — 동기화 필요)</option>}
           {dongList.map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
       </Field>
       {!form.dong && (
         <p className="meta" style={{ marginTop: -4, marginBottom: 10 }}>
-          동을 비워두면 직전에 작업하던 동이 자동으로 적용됩니다. 공기연장 집계에도 그 동으로 잡힙니다.
+          {unit}을 비워두면 직전에 작업하던 {unit}이 자동으로 적용됩니다. 공기연장 집계에도 그 {unit}으로 잡힙니다.
+        </p>
+      )}
+      {scope.key === "facility" && (
+        <p className="meta" style={{ marginTop: -4, marginBottom: 10 }}>
+          구역을 고르면 엑셀 부대시설 실적시트의 해당구역 칸에 그대로 들어가고, ③달성률현황·④만회계획의 구역별 표에 바로 반영됩니다.
         </p>
       )}
       {pairRows(workerFields).map((pair, ri) => (
@@ -1047,6 +1067,9 @@ function Basis({ basis }) {
 }
 
 function AreaDashCard({ scope, dash }) {
+  const unit = scope.unitName || "동";
+  const isFacility = scope.key === "facility";
+  const unassigned = Number(dash.unassigned) || 0;
   return (
     <>
       <div className="card">
@@ -1063,10 +1086,10 @@ function AreaDashCard({ scope, dash }) {
         </div>
       </div>
       <div className="card">
-        <h2>동별 달성률 현황</h2>
+        <h2>{unit}별 달성률 현황</h2>
         <SourceNote dash={dash} />
         <table className="dashtable">
-          <thead><tr><th>동</th><th>계획(m²)</th><th>실적(m²)</th><th>달성률</th><th>상태</th></tr></thead>
+          <thead><tr><th>{unit}</th><th>계획(m²)</th><th>실적(m²)</th><th>달성률</th><th>상태</th></tr></thead>
           <tbody>
             {dash.byBuilding.map((b) => (
               <tr key={b.dong}>
@@ -1077,9 +1100,32 @@ function AreaDashCard({ scope, dash }) {
                 <td style={{ color: b.status.color }}>{b.status.label}</td>
               </tr>
             ))}
+            {unassigned > 0 && (
+              <tr>
+                <td className="dong">구역 미분류</td>
+                <td>-</td>
+                <td>{fmtNum(unassigned)}</td>
+                <td>-</td>
+                <td style={{ color: "#e8a700" }}>⚠️ 구역 확인</td>
+              </tr>
+            )}
+            <tr style={{ fontWeight: 700, background: "#eef2fb" }}>
+              <td className="dong">합 계</td>
+              <td>{fmtNum(dash.totalPlanArea)}</td>
+              <td>{fmtNum(dash.cumActual)}</td>
+              <td>{fmtPct(dash.overallRate)}</td>
+              <td />
+            </tr>
             {dash.byBuilding.length === 0 && <tr><td colSpan="5" className="meta">기준정보가 없습니다 — 동기화하세요.</td></tr>}
           </tbody>
         </table>
+        {isFacility && (
+          <p className="meta" style={{ marginTop: 8 }}>
+            구역 배정 = 실적의 해당 구역이 기준정보 구역명과 같거나, 비고에 근생 / 주공 / 문주·경비 / 어린이·돌봄 / 썬큰
+            키워드가 있으면 자동 분류합니다(엑셀 ③달성률현황 부대시설 표와 동일한 규칙).
+            {unassigned > 0 && ` 현재 ${fmtNum(unassigned)} m²가 구역 미분류입니다 — 해당 행의 비고에 구역 키워드를 넣어주세요.`}
+          </p>
+        )}
       </div>
     </>
   );
@@ -1199,8 +1245,9 @@ function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecover
         {recovery && (
           <div className="banner info" style={{ marginBottom: 10 }}>
             1인당 일일생산성: {fmtNum(recovery.productivity)}㎡/명 — {recovery.productivitySource === "actual"
-              ? `실행 생산성 (누적실적 ${fmtNum(recovery.cumActual)}㎡ ÷ 실작업 투입 ${fmtNum(recovery.cumWorkers, 0)}명, 동별)`
+              ? `실행 생산성 (누적실적 ${fmtNum(recovery.cumActual)}㎡ ÷ 실작업 투입 ${fmtNum(recovery.cumWorkers, 0)}명)`
               : `실적 없음 → 엑셀 ①기준정보 기준값 ${thresholds.productivityPerWorker}㎡`}
+            {recovery.baseWorkersSource === "actual" && " · 기준인원은 실적 평균으로 대체(기준정보 미입력)"}
           </div>
         )}
         <Field label="공사 범위">
@@ -1208,7 +1255,7 @@ function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecover
             {AREA_SCOPES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
           </select>
         </Field>
-        <Field label="대상 동 선택">
+        <Field label={`대상 ${SCOPE_BY_KEY[recoveryScope]?.unitName || "동"} 선택`}>
           <select value={recoveryDong} onChange={(e) => setRecoveryDong(e.target.value)}>
             {dongList.length === 0 && <option value="">(기준정보 없음)</option>}
             {dongList.map((d) => <option key={d} value={d}>{d}</option>)}
@@ -1220,14 +1267,14 @@ function RecoveryTab({ recoveryScope, setRecoveryScope, recoveryDong, setRecover
             <div className="stat"><div className="label">누적 실적</div><div className="value">{fmtNum(recovery.cumActual)} m²</div></div>
             <div className="stat"><div className="label">현재 달성률</div><div className="value">{fmtPct(recovery.currentRate)}</div></div>
             <div className="stat"><div className="label">잔여 계획량</div><div className="value">{fmtNum(recovery.remainArea)} m²</div></div>
-            <div className="stat"><div className="label">계획 완료일</div><div className="value">{recovery.endDate}</div></div>
-            <div className="stat"><div className="label">잔여 일수</div><div className="value">{recovery.remainDays}일</div></div>
-            <div className="stat"><div className="label">실 가용 작업일</div><div className="value">{recovery.availableDays}일</div></div>
-            <div className="stat"><div className="label">기준 투입인원</div><div className="value">{recovery.baseWorkers}명</div></div>
-            <div className="stat"><div className="label">현 인원 일일생산가능량</div><div className="value">{fmtNum(recovery.currentCapacity)} m²</div></div>
+            <div className="stat"><div className="label">계획 완료일</div><div className="value">{recovery.endDate || "미입력"}</div></div>
+            <div className="stat"><div className="label">잔여 일수</div><div className="value">{recovery.remainDays === null ? "-" : `${recovery.remainDays}일`}</div></div>
+            <div className="stat"><div className="label">실 가용 작업일</div><div className="value">{recovery.availableDays === null ? "-" : `${recovery.availableDays}일`}</div></div>
+            <div className="stat"><div className="label">기준 투입인원</div><div className="value">{recovery.baseWorkers ? `${recovery.baseWorkers}명` : "미입력"}</div></div>
+            <div className="stat"><div className="label">현 인원 일일생산가능량</div><div className="value">{recovery.baseWorkers ? `${fmtNum(recovery.currentCapacity)} m²` : "-"}</div></div>
             <div className="stat"><div className="label">1인당 일일생산성</div><div className="value">{fmtNum(recovery.productivity)} m²</div></div>
-            <div className="stat"><div className="label">만회 필요 일일생산량</div><div className="value">{typeof recovery.neededDaily === "number" ? fmtNum(recovery.neededDaily) + " m²" : recovery.neededDaily}</div></div>
-            <div className="stat"><div className="label">만회 필요 추가인원</div><div className="value">{recovery.extraWorkers}명</div></div>
+            <div className="stat"><div className="label">만회 필요 일일생산량</div><div className="value">{typeof recovery.neededDaily === "number" ? fmtNum(recovery.neededDaily) + " m²" : (recovery.neededDaily || "-")}</div></div>
+            <div className="stat"><div className="label">만회 필요 추가인원</div><div className="value">{recovery.extraWorkers === null ? "-" : `${recovery.extraWorkers}명`}</div></div>
           </div>
         )}
         {recovery && <div className="banner info" style={{ marginTop: 10 }}>{recovery.verdict}</div>}
@@ -1265,20 +1312,31 @@ function BaseTab({ areaB, buildingsInternal, thresholds }) {
         <div className="card" key={s.key}>
           <h2>{s.label} · 시공 계획 수량</h2>
           <table className="dashtable">
-            <thead><tr><th>동</th><th>전체수량(m²)</th><th>시작일</th><th>완료예정</th><th>기준인원</th></tr></thead>
+            <thead><tr><th>{s.unitName || "동"}</th><th>전체수량(m²)</th><th>시작일</th><th>완료예정</th><th>기준인원</th></tr></thead>
             <tbody>
               {(areaB[s.key] || []).map((b) => (
                 <tr key={b.dong}>
                   <td className="dong">{b.dong}</td>
                   <td>{fmtNum(b.totalArea)}</td>
-                  <td>{b.startDate}</td>
-                  <td>{b.endDate}</td>
-                  <td>{b.baseWorkers}명</td>
+                  <td>{b.startDate || "-"}</td>
+                  <td>{b.endDate || "-"}</td>
+                  <td>{b.baseWorkers ? `${b.baseWorkers}명` : "-"}</td>
                 </tr>
               ))}
+              <tr style={{ fontWeight: 700, background: "#eef2fb" }}>
+                <td className="dong">합 계</td>
+                <td>{fmtNum((areaB[s.key] || []).reduce((t, b) => t + (Number(b.totalArea) || 0), 0))}</td>
+                <td colSpan="3" />
+              </tr>
               {(areaB[s.key] || []).length === 0 && <tr><td colSpan="5" className="meta">기준정보 없음 — 동기화하세요.</td></tr>}
             </tbody>
           </table>
+          {s.key === "facility" && (
+            <p className="meta" style={{ marginTop: 6 }}>
+              부대시설 계획수량은 엑셀 ⑥석재발주 집계와 연동됩니다. 착공일·완료예정일·기준인원이 "-"인 구역은
+              엑셀 ①기준정보 부대시설 표(노란칸)에 입력해야 만회계획의 잔여일수·필요인원이 산출됩니다.
+            </p>
+          )}
         </div>
       ))}
       <div className="card">
