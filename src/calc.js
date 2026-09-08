@@ -26,11 +26,25 @@ export function daysBetween(a, b) {
 
 // ---------- 외부(아파트) ----------
 
+// 일일 "목표(계획) 시공량" 산정 방식 — 엑셀 각 실적시트의 I열 수식을 그대로 따른다.
+//   workers11 : 투입인원계 × 11   → ②일일실적입력        (I = H*11)
+//   masonry9  : 석공 인원  × 9    → ②일일실적입력(부대시설) (I = D*9)
+//   plan      : 기준정보의 계획 일평균 → ②일일실적입력(호이스트) (I = VLOOKUP 계획일평균)
+// 예전에는 전 범위가 "plan"이라 엑셀 화면의 일일달성률과 앱 숫자가 어긋났다.
+export const PLANNED_MODE = { WORKERS11: "workers11", MASONRY9: "masonry9", PLAN: "plan" };
+
+export function plannedForRow(entry, buildings, mode = PLANNED_MODE.PLAN) {
+  const totalWorkers = (Number(entry.masonry) || 0) + (Number(entry.caulking) || 0) + (Number(entry.truss) || 0) + (Number(entry.scaffold) || 0);
+  if (mode === PLANNED_MODE.WORKERS11) return totalWorkers * 11;
+  if (mode === PLANNED_MODE.MASONRY9) return (Number(entry.masonry) || 0) * 9;
+  const b = (buildings || []).find((x) => x.dong === entry.dong);
+  return b ? b.dailyPlan : "";
+}
+
 // ②일일실적입력 행 1건의 자동계산 필드 (H=투입인원계, I=계획시공량, K=일일달성률)
-export function calcRowExternal(entry, buildings) {
+export function calcRowExternal(entry, buildings, mode = PLANNED_MODE.PLAN) {
   const totalWorkers = (entry.masonry || 0) + (entry.caulking || 0) + (entry.truss || 0) + (entry.scaffold || 0);
-  const b = buildings.find((x) => x.dong === entry.dong);
-  const planned = b ? b.dailyPlan : "";
+  const planned = plannedForRow(entry, buildings, mode);
   const actual = entry.actual;
   const rate = planned !== "" && planned > 0 && actual !== "" && actual !== null && actual !== undefined
     ? actual / planned
@@ -38,12 +52,63 @@ export function calcRowExternal(entry, buildings) {
   return { ...entry, totalWorkers, planned, rate };
 }
 
+// ---------- 부대시설 구역 분류 ----------
+// 엑셀 ③달성률현황 "부대시설 달성률 현황" 표와 동일한 규칙으로 실적 1건을 구역에 배정한다.
+//   1) 실적행의 해당 동(구역) 값이 기준정보의 구역명과 정확히 같으면 그 구역   ← 앱에서 입력한 건
+//   2) 아니면 비고·특기사항·동 텍스트에 구역 키워드가 있으면 그 구역          ← 과거 수기 입력분
+//   3) 둘 다 아니면 "" (구역 미분류)
+// 부대시설 실적시트는 C열이 전부 "부대시설"로 들어가 있어 구역 구분이 비고에만 남아 있다.
+// 시트 양식(모바일앱 연동)은 건드리지 않기로 했으므로 읽는 쪽에서 분류한다.
+export const FACILITY_ZONE_KEYWORDS = {
+  "근생2": ["근생"],
+  "게스트하우스·주공1": ["주공"],
+  "문주·경비실": ["문주", "경비"],
+  "어린이집·돌봄센터": ["어린이", "돌봄"],
+  "게스트하우스(썬큰)": ["썬큰"],
+};
+
+// 기준정보에서 구역명을 바꾼 경우를 대비한 폴백 키워드 (이름 자체 + 괄호·구분자 앞부분)
+function fallbackKeys(name) {
+  const s = String(name || "").trim();
+  if (!s) return [];
+  const head = s.split(/[·,()（）/]/)[0].trim();
+  return [s, head].filter((x) => x && x.length >= 2);
+}
+
+export function facilityZoneOf(log, zoneNames) {
+  const names = (zoneNames && zoneNames.length) ? zoneNames : Object.keys(FACILITY_ZONE_KEYWORDS);
+  const dong = String(log?.dong ?? "").trim();
+  if (dong && names.includes(dong)) return dong;
+  const text = [log?.memo, log?.note, dong].map((v) => String(v ?? "")).join(" ");
+  if (!text.trim()) return "";
+  for (const name of names) {
+    const keys = FACILITY_ZONE_KEYWORDS[name] || fallbackKeys(name);
+    if (keys.some((k) => k && text.includes(k))) return name;
+  }
+  return "";
+}
+
+// 부대시설 실적 목록의 dong을 "구역"으로 정규화. 미분류는 dong=""로 남겨 어느 구역에도 잡히지 않게 한다.
+export function resolveFacilityLogs(logs, zoneNames) {
+  return (logs || []).map((l) => {
+    const zone = facilityZoneOf(l, zoneNames);
+    return { ...l, dong: zone, zone, rawDong: l.dong, unassigned: !zone };
+  });
+}
+
+// 구역 미분류 실적 합계 (대시보드에 별도 행으로 표시)
+export function facilityUnassigned(resolvedLogs) {
+  return (resolvedLogs || []).filter((l) => l.unassigned).reduce((s, l) => s + (Number(l.actual) || 0), 0);
+}
+
 // ③달성률현황
-export function calcExternalDashboard(buildings, logs, th = THRESHOLDS) {
-  const rows = logs.map((l) => calcRowExternal(l, buildings));
+export function calcExternalDashboard(buildings, logs, th = THRESHOLDS, mode = PLANNED_MODE.PLAN) {
+  const rows = logs.map((l) => calcRowExternal(l, buildings, mode));
   const totalPlanArea = buildings.reduce((s, b) => s + b.totalArea, 0);
   const cumActual = rows.reduce((s, r) => s + (Number(r.actual) || 0), 0);
-  const cumPlan = rows.reduce((s, r) => s + (r.dong ? Number(r.planned) || 0 : 0), 0);
+  // 엑셀 ③달성률현황 C8 = SUMIF(날짜<>"", I열) 과 동일하게, 날짜가 있는 모든 행의 목표를 더한다.
+  // (예전에는 동이 비어 있는 행을 빼서 엑셀 숫자와 어긋났다)
+  const cumPlan = rows.reduce((s, r) => s + (r.date ? Number(r.planned) || 0 : 0), 0);
   const overallRate = totalPlanArea > 0 ? cumActual / totalPlanArea : "";
   const periodRate = cumPlan > 0 ? cumActual / cumPlan : "";
   const totalWorkers = rows.reduce((s, r) => s + (Number(r.totalWorkers) || 0), 0);
@@ -233,27 +298,46 @@ export function calcRecoveryPlan(dong, buildings, logs, today = new Date(), th =
   const planArea = b.totalArea;
   const currentRate = planArea > 0 ? cumActual / planArea : 0;
   const remainArea = Math.max(0, planArea - cumActual);
-  const endDate = b.endDate;
-  const remainDays = Math.max(0, daysBetween(today, endDate));
-  const availableDays = Math.max(1, Math.round(remainDays * 0.85));
-  const baseWorkers = b.baseWorkers;
+  const endDate = b.endDate || "";
+  // 부대시설처럼 완료예정일이 아직 "미정"인 구역이 있다. 그대로 계산하면 NaN이 화면에 뜨므로
+  // 날짜가 없으면 일수 계산을 건너뛰고 "완료예정일 미입력"으로 알린다.
+  const rawDays = endDate ? daysBetween(today, endDate) : NaN;
+  const hasEnd = Number.isFinite(rawDays);
+  const remainDays = hasEnd ? Math.max(0, rawDays) : null;
+  const availableDays = hasEnd ? Math.max(1, Math.round(remainDays * 0.85)) : null;
+
   // 1인당 일일생산성은 동마다 다름 — 실제 누적 실적(㎡) ÷ 실제 누적 투입인원(man-day).
   // 아직 투입 실적이 없는 동은 엑셀 ①기준정보의 기준값(1인당 일일 시공량)으로 폴백.
   const hasActual = cumWorkers > 0 && cumActual > 0;
   const productivity = hasActual ? cumActual / cumWorkers : th.productivityPerWorker;
   const productivitySource = hasActual ? "actual" : "base";
+
+  // 기준 투입인원이 비어 있으면(부대시설 신규 구역 등) 실적이 있는 날의 평균 투입인원으로 대체.
+  const workedDays = dongLogs.filter((l) => Number(l.actual) > 0).length;
+  const sheetWorkers = Number(b.baseWorkers) || 0;
+  const baseWorkers = sheetWorkers > 0
+    ? sheetWorkers
+    : (workedDays > 0 ? Math.max(1, Math.round(cumWorkers / workedDays)) : 0);
+  const baseWorkersSource = sheetWorkers > 0 ? "base" : (workedDays > 0 ? "actual" : "none");
+
   const currentCapacity = baseWorkers * productivity;
-  const neededDaily = remainArea === 0 ? "완료" : remainArea / availableDays;
-  const extraWorkers = neededDaily === "완료" ? 0 : Math.max(0, Math.ceil(neededDaily / productivity) - baseWorkers);
+  const neededDaily = remainArea === 0 ? "완료" : (hasEnd ? remainArea / availableDays : null);
+  const extraWorkers = neededDaily === "완료"
+    ? 0
+    : (neededDaily === null ? null : Math.max(0, Math.ceil(neededDaily / productivity) - baseWorkers));
+
   let verdict;
   if (neededDaily === "완료") verdict = "✅ 계획 수량 달성 완료";
+  else if (!hasEnd) verdict = "⏸ 완료예정일 미입력 — 엑셀 ①기준정보에 완료예정일을 넣어야 만회 산출이 됩니다";
+  else if (baseWorkers === 0) verdict = "⏸ 기준 투입인원 미입력 — 엑셀 ①기준정보에 기준인원을 넣어주세요";
   else if (neededDaily <= currentCapacity) verdict = "✅ 현인원으로 만회 가능";
   else if (extraWorkers <= 3) verdict = "⚠️ 소폭 증원 필요";
   else verdict = "🚨 대폭 증원 또는 공기연장 검토";
 
   return {
-    dong, planArea, cumActual, cumWorkers, currentRate, remainArea, endDate, remainDays,
-    availableDays, baseWorkers, productivity, productivitySource, currentCapacity, neededDaily, extraWorkers, verdict,
+    dong, planArea, cumActual, cumWorkers, currentRate, remainArea, endDate, hasEnd, remainDays,
+    availableDays, baseWorkers, baseWorkersSource, productivity, productivitySource, currentCapacity,
+    neededDaily, extraWorkers, verdict,
   };
 }
 
